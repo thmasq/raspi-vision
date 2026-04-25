@@ -1,3 +1,5 @@
+mod apriltag;
+
 use axum::{
     Json, Router,
     extract::{
@@ -34,13 +36,15 @@ struct CameraControls {
 }
 
 struct AppState {
-    tx: broadcast::Sender<Vec<u8>>,
+    tx_video: broadcast::Sender<Vec<u8>>,
+    tx_tags: broadcast::Sender<String>,
     controls_tx: watch::Sender<CameraControls>,
 }
 
 #[tokio::main]
 async fn main() {
-    let (tx, _) = broadcast::channel::<Vec<u8>>(16);
+    let (tx_video, _) = broadcast::channel::<Vec<u8>>(16);
+    let (tx_tags, _) = broadcast::channel::<String>(16);
 
     let (controls_tx, controls_rx) = watch::channel(CameraControls {
         ae_enable: true,
@@ -49,13 +53,14 @@ async fn main() {
     });
 
     let app_state = Arc::new(AppState {
-        tx: tx.clone(),
+        tx_video: tx_video.clone(),
+        tx_tags: tx_tags.clone(),
         controls_tx,
     });
 
     let capture_controls_rx = controls_rx.clone();
     tokio::task::spawn_blocking(move || {
-        capture_loop(tx, capture_controls_rx);
+        capture_loop(tx_video, tx_tags, capture_controls_rx);
     });
 
     let app = Router::new()
@@ -83,14 +88,21 @@ async fn websocket_handler(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    let mut rx = state.tx.subscribe();
-    while let Ok(frame_data) = rx.recv().await {
-        if socket
-            .send(Message::Binary(frame_data.into()))
-            .await
-            .is_err()
-        {
-            break;
+    let mut rx_video = state.tx_video.subscribe();
+    let mut rx_tags = state.tx_tags.subscribe();
+
+    loop {
+        tokio::select! {
+            Ok(frame_data) = rx_video.recv() => {
+                if socket.send(Message::Binary(frame_data.into())).await.is_err() {
+                    break;
+                }
+            }
+            Ok(tags_json) = rx_tags.recv() => {
+                if socket.send(Message::Text(tags_json.into())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -103,7 +115,11 @@ async fn update_controls(
     axum::http::StatusCode::OK
 }
 
-fn capture_loop(tx: broadcast::Sender<Vec<u8>>, controls_rx: watch::Receiver<CameraControls>) {
+fn capture_loop(
+    tx_video: broadcast::Sender<Vec<u8>>,
+    tx_tags: broadcast::Sender<String>,
+    controls_rx: watch::Receiver<CameraControls>,
+) {
     let mgr = CameraManager::new().expect("Failed to initialize libcamera");
     let cameras = mgr.cameras();
     let cam = cameras.get(0).expect("No cameras found");
@@ -153,6 +169,19 @@ fn capture_loop(tx: broadcast::Sender<Vec<u8>>, controls_rx: watch::Receiver<Cam
         cam_tx.send(req).unwrap();
     });
 
+    let mut global_uf = crate::apriltag::unionfind::RleUnionFind::new(8000);
+    let mut mono_image =
+        crate::apriltag::image::Image::new_simd_aligned(STREAM_WIDTH, STREAM_HEIGHT);
+    let mut threshold_img =
+        crate::apriltag::image::Image::new_simd_aligned(STREAM_WIDTH, STREAM_HEIGHT);
+    let intrinsics = crate::apriltag::pose::CameraIntrinsics {
+        fx: 500.0,
+        fy: 500.0,
+        cx: 320.0,
+        cy: 240.0,
+        tag_size_mm: 165.0,
+    };
+
     println!(
         "Starting capture loop at {}x{}...",
         CAPTURE_WIDTH, CAPTURE_HEIGHT
@@ -191,7 +220,42 @@ fn capture_loop(tx: broadcast::Sender<Vec<u8>>, controls_rx: watch::Receiver<Cam
                     }
                 }
             }
-            let _ = tx.send(stream_bytes);
+
+            let _ = tx_video.send(stream_bytes.clone());
+
+            mono_image.as_mut_slice().copy_from_slice(&stream_bytes);
+            crate::apriltag::threshold::process(&mono_image, &mut threshold_img);
+
+            global_uf.clear();
+            global_uf.process_chunk(threshold_img.as_mut_slice(), STREAM_WIDTH, STREAM_HEIGHT, 0);
+            global_uf.flatten();
+            let blobs = global_uf.extract_valid_blobs(50, 10_000);
+
+            let mut valid_detections = Vec::new();
+
+            for blob in &blobs {
+                let boundary =
+                    crate::apriltag::quad::extract_ordered_boundary(blob, &global_uf.segments);
+
+                if let Some(corners) = crate::apriltag::quad::find_quad_corners(&boundary) {
+                    if let Some(detection) = crate::apriltag::decode::extract_detection(
+                        &mono_image,
+                        &corners,
+                        &intrinsics,
+                    ) {
+                        valid_detections.push(detection);
+                        if valid_detections.len() >= 10 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !valid_detections.is_empty() {
+                if let Ok(json) = serde_json::to_string(&valid_detections) {
+                    let _ = tx_tags.send(json);
+                }
+            }
         }
 
         req.reuse(libcamera::request::ReuseFlag::REUSE_BUFFERS);
