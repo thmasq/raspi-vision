@@ -14,10 +14,14 @@
             font-family: sans-serif; 
         }
         h1 { margin-bottom: 10px; }
+        .canvas-container {
+            position: relative;
+            margin-top: 20px;
+        }
         canvas { 
             background: #000; 
             border: 2px solid #333; 
-            margin-top: 20px; 
+            display: block;
         }
         .control-panel { 
             background: #222; 
@@ -58,7 +62,9 @@
         </div>
     </div>
 
-    <canvas id="videoCanvas" width="640" height="480"></canvas>
+    <div class="canvas-container">
+        <canvas id="videoCanvas" width="640" height="480"></canvas>
+    </div>
 
     <script>
         const aeEnableInput = document.getElementById('ae_enable');
@@ -92,7 +98,6 @@
         exposureTimeInput.addEventListener('change', sendControls);
         gainInput.addEventListener('change', sendControls);
 
-
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');
         
@@ -103,28 +108,67 @@
         ws.binaryType = 'arraybuffer';
         
         const imgData = ctx.createImageData(width, height);
+        
+        let latestTags = [];
 
         ws.onopen = () => console.log('WebSocket connected');
         
         ws.onmessage = (event) => {
-            const lumaData = new Uint8Array(event.data);
-            
-            if (lumaData.length !== width * height) {
-                console.warn("Received frame of incorrect size:", lumaData.length);
-                return;
-            }
+            if (typeof event.data === "string") {
+                try {
+                    latestTags = JSON.parse(event.data);
+                } catch (e) {
+                    console.error("Failed to parse tags:", e);
+                }
+            } else if (event.data instanceof ArrayBuffer) {
+                const lumaData = new Uint8Array(event.data);
+                
+                if (lumaData.length !== width * height) {
+                    console.warn("Received frame of incorrect size:", lumaData.length);
+                    return;
+                }
 
-            for (let i = 0; i < lumaData.length; i++) {
-                const luma = lumaData[i];
-                const rgbaIndex = i * 4;
-                imgData.data[rgbaIndex]     = luma; // Red
-                imgData.data[rgbaIndex + 1] = luma; // Green
-                imgData.data[rgbaIndex + 2] = luma; // Blue
-                imgData.data[rgbaIndex + 3] = 255;  // Alpha
-            }
+                for (let i = 0; i < lumaData.length; i++) {
+                    const luma = lumaData[i];
+                    const rgbaIndex = i * 4;
+                    imgData.data[rgbaIndex]     = luma; // Red
+                    imgData.data[rgbaIndex + 1] = luma; // Green
+                    imgData.data[rgbaIndex + 2] = luma; // Blue
+                    imgData.data[rgbaIndex + 3] = 255;  // Alpha
+                }
+                ctx.putImageData(imgData, 0, 0);
 
-            ctx.putImageData(imgData, 0, 0);
+                drawOverlay();
+            }
         };
+
+        function drawOverlay() {
+            if (!latestTags || latestTags.length === 0) return;
+
+            for (const tag of latestTags) {
+                const cx = tag.center_x;
+                const cy = tag.center_y;
+
+                ctx.strokeStyle = "#00FF00";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(cx - 10, cy);
+                ctx.lineTo(cx + 10, cy);
+                ctx.moveTo(cx, cy - 10);
+                ctx.lineTo(cx, cy + 10);
+                ctx.stroke();
+
+                ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+                ctx.fillRect(cx + 10, cy - 25, 180, 60);
+
+                ctx.font = "14px monospace";
+                ctx.fillStyle = "#00FF00";
+                ctx.fillText(`ID  : ${tag.id}`, cx + 15, cy - 10);
+                ctx.fillText(`Dist: ${(tag.distance_mm / 10).toFixed(1)} cm`, cx + 15, cy + 8);
+                ctx.fillText(`Rot : ${tag.yaw.toFixed(0)}°, ${tag.pitch.toFixed(0)}°, ${tag.roll.toFixed(0)}°`, cx + 15, cy + 26);
+            }
+            latestTags = [];
+        }
 
         ws.onclose = () => console.log('WebSocket disconnected');
         ws.onerror = (err) => console.error('WebSocket Error:', err);
