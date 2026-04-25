@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Pi OV5647 Raw Grayscale Stream</title>
+    <style>
+        body { 
+            background: #111; 
+            color: white; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            margin-top: 50px; 
+            font-family: sans-serif; 
+        }
+        h1 { margin-bottom: 10px; }
+        canvas { 
+            background: #000; 
+            border: 2px solid #333; 
+            margin-top: 20px; 
+        }
+        .control-panel { 
+            background: #222; 
+            padding: 20px; 
+            border-radius: 8px; 
+            display: flex; 
+            flex-direction: column; 
+            gap: 15px; 
+            width: 400px;
+            border: 1px solid #444;
+        }
+        .control-group { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }
+    </style>
+</head>
+<body>
+    <h1>Uncompressed VGA Stream</h1>
+
+    <div class="control-panel">
+        <div class="control-group">
+            <label for="ae_enable">Auto Exposure (AE)</label>
+            <input type="checkbox" id="ae_enable" checked>
+        </div>
+        
+        <div class="control-group">
+            <label for="exposure_time">Exposure Time (µs)</label>
+            <input type="range" id="exposure_time" min="1000" max="66000" step="1000" value="20000" disabled>
+            <span id="exposure_val" style="width: 50px; text-align: right;">20000</span>
+        </div>
+
+        <div class="control-group">
+            <label for="gain">Analogue Gain</label>
+            <input type="range" id="gain" min="1.0" max="16.0" step="0.5" value="1.0" disabled>
+            <span id="gain_val" style="width: 50px; text-align: right;">1.0</span>
+        </div>
+    </div>
+
+    <canvas id="videoCanvas" width="640" height="480"></canvas>
+
+    <script>
+        const aeEnableInput = document.getElementById('ae_enable');
+        const exposureTimeInput = document.getElementById('exposure_time');
+        const gainInput = document.getElementById('gain');
+
+        const exposureVal = document.getElementById('exposure_val');
+        const gainVal = document.getElementById('gain_val');
+
+        function sendControls() {
+            fetch('/controls', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    ae_enable: aeEnableInput.checked,
+                    exposure_time: parseInt(exposureTimeInput.value),
+                    analogue_gain: parseFloat(gainInput.value)
+                })
+            }).catch(err => console.error("Failed to send controls:", err));
+        }
+
+        aeEnableInput.addEventListener('change', (e) => {
+            exposureTimeInput.disabled = e.target.checked;
+            gainInput.disabled = e.target.checked;
+            sendControls();
+        });
+
+        exposureTimeInput.addEventListener('input', (e) => exposureVal.innerText = e.target.value);
+        gainInput.addEventListener('input', (e) => gainVal.innerText = parseFloat(e.target.value).toFixed(1));
+
+        exposureTimeInput.addEventListener('change', sendControls);
+        gainInput.addEventListener('change', sendControls);
+
+
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        const width = 640;
+        const height = 480;
+        
+        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        ws.binaryType = 'arraybuffer';
+        
+        const imgData = ctx.createImageData(width, height);
+
+        ws.onopen = () => console.log('WebSocket connected');
+        
+        ws.onmessage = (event) => {
+            const lumaData = new Uint8Array(event.data);
+            
+            if (lumaData.length !== width * height) {
+                console.warn("Received frame of incorrect size:", lumaData.length);
+                return;
+            }
+
+            for (let i = 0; i < lumaData.length; i++) {
+                const luma = lumaData[i];
+                const rgbaIndex = i * 4;
+                imgData.data[rgbaIndex]     = luma; // Red
+                imgData.data[rgbaIndex + 1] = luma; // Green
+                imgData.data[rgbaIndex + 2] = luma; // Blue
+                imgData.data[rgbaIndex + 3] = 255;  // Alpha
+            }
+
+            ctx.putImageData(imgData, 0, 0);
+        };
+
+        ws.onclose = () => console.log('WebSocket disconnected');
+        ws.onerror = (err) => console.error('WebSocket Error:', err);
+    </script>
+</body>
+</html>
