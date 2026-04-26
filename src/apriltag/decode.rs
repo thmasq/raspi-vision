@@ -1,6 +1,5 @@
 use crate::apriltag::image::Image;
 use crate::apriltag::pose::{CameraIntrinsics, estimate_tag_pose};
-use crate::apriltag::quad::Point;
 use nalgebra::{SMatrix, SVector};
 use serde::Serialize;
 
@@ -633,15 +632,15 @@ pub struct Homography {
 }
 
 impl Homography {
-    pub fn compute(corners: &[Point; 4]) -> Option<Self> {
+    pub fn compute(corners: &[[f32; 2]; 4]) -> Option<Self> {
         let ideal = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
         let mut a = SMatrix::<f32, 8, 8>::zeros();
         let mut b = SVector::<f32, 8>::zeros();
 
         for i in 0..4 {
             let (ix, iy) = ideal[i];
-            let px = corners[i].x as f32;
-            let py = corners[i].y as f32;
+            let px = corners[i][0];
+            let py = corners[i][1];
 
             a[(i * 2, 0)] = ix;
             a[(i * 2, 1)] = iy;
@@ -782,7 +781,7 @@ fn match_payload(mut payload: u64) -> Option<(u16, u8, u8)> {
 /// Takes a bounding quad and extracts the AprilTag data, returning a valid detection.
 pub fn extract_detection(
     image: &Image,
-    corners: &[Point; 4],
+    corners: &[[f32; 2]; 4],
     intrinsics: &CameraIntrinsics,
 ) -> Option<AprilTagDetection> {
     let homo = Homography::compute(corners)?;

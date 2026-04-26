@@ -12,7 +12,7 @@ use axum::{
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::{camera_manager::CameraManager, controls, formats};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,11 +28,19 @@ const STREAM_HEIGHT: usize = 480;
 const STREAM_EVERY_N_FRAMES: usize = 3;
 
 // --- CAMERA CONTROLS ---
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum DebugView {
+    Raw,
+    Threshold,
+    Segments,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct CameraControls {
     ae_enable: bool,
     exposure_time: i32,
     analogue_gain: f32,
+    debug_view: DebugView,
 }
 
 struct AppState {
@@ -50,6 +58,7 @@ async fn main() {
         ae_enable: true,
         exposure_time: 20000,
         analogue_gain: 1.0,
+        debug_view: DebugView::Raw,
     });
 
     let app_state = Arc::new(AppState {
@@ -169,7 +178,8 @@ fn capture_loop(
         cam_tx.send(req).unwrap();
     });
 
-    let mut global_uf = crate::apriltag::unionfind::RleUnionFind::new(8000);
+    let mut global_uf =
+        crate::apriltag::unionfind::UnionFind::new((STREAM_WIDTH * STREAM_HEIGHT) as u32);
     let mut mono_image =
         crate::apriltag::image::Image::new_simd_aligned(STREAM_WIDTH, STREAM_HEIGHT);
     let mut threshold_img =
@@ -208,6 +218,8 @@ fn capture_loop(
             fps_timer = Instant::now();
         }
 
+        let current_controls = controls_rx.borrow().clone();
+
         if total_frames % STREAM_EVERY_N_FRAMES == 0 {
             let mut stream_bytes = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
             for y in 0..STREAM_HEIGHT {
@@ -221,23 +233,39 @@ fn capture_loop(
                 }
             }
 
-            let _ = tx_video.send(stream_bytes.clone());
-
             mono_image.as_mut_slice().copy_from_slice(&stream_bytes);
             crate::apriltag::threshold::process(&mono_image, &mut threshold_img);
 
             global_uf.clear();
-            global_uf.process_chunk(threshold_img.as_mut_slice(), STREAM_WIDTH, STREAM_HEIGHT, 0);
-            global_uf.flatten();
-            let blobs = global_uf.extract_valid_blobs(50, 10_000);
+            global_uf.connected_components(threshold_img.as_slice(), STREAM_WIDTH, STREAM_HEIGHT);
+            let clusters =
+                global_uf.gradient_clusters(threshold_img.as_slice(), STREAM_WIDTH, STREAM_HEIGHT);
+
+            let debug_frame = match current_controls.debug_view {
+                DebugView::Raw => stream_bytes,
+                DebugView::Threshold => threshold_img.as_slice().to_vec(),
+                DebugView::Segments => {
+                    let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+                    for cluster in &clusters {
+                        for pt in &cluster.points {
+                            let px = (pt.x / 2) as usize;
+                            let py = (pt.y / 2) as usize;
+                            let idx = py * STREAM_WIDTH + px;
+                            if idx < buf.len() {
+                                buf[idx] = 255;
+                            }
+                        }
+                    }
+                    buf
+                }
+            };
+
+            let _ = tx_video.send(debug_frame);
 
             let mut valid_detections = Vec::new();
 
-            for blob in &blobs {
-                let boundary =
-                    crate::apriltag::quad::extract_ordered_boundary(blob, &global_uf.segments);
-
-                if let Some(corners) = crate::apriltag::quad::find_quad_corners(&boundary) {
+            for cluster in &clusters {
+                if let Some(corners) = crate::apriltag::quad::find_quad_corners(cluster) {
                     if let Some(detection) = crate::apriltag::decode::extract_detection(
                         &mono_image,
                         &corners,
@@ -259,8 +287,6 @@ fn capture_loop(
         }
 
         req.reuse(libcamera::request::ReuseFlag::REUSE_BUFFERS);
-
-        let current_controls = controls_rx.borrow().clone();
 
         let controls = req.controls_mut();
 

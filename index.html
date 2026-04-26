@@ -60,6 +60,15 @@
             <input type="range" id="gain" min="1.0" max="16.0" step="0.5" value="1.0" disabled>
             <span id="gain_val" style="width: 50px; text-align: right;">1.0</span>
         </div>
+
+        <div class="control-group">
+            <label for="debug_view">Pipeline View</label>
+            <select id="debug_view" style="background: #333; color: white; border: 1px solid #555; padding: 4px;">
+                <option value="Raw">1. Raw Grayscale</option>
+                <option value="Threshold">2. Adaptive Threshold</option>
+                <option value="Segments">3. Extracted Blobs</option>
+            </select>
+        </div>
     </div>
 
     <div class="canvas-container">
@@ -70,6 +79,7 @@
         const aeEnableInput = document.getElementById('ae_enable');
         const exposureTimeInput = document.getElementById('exposure_time');
         const gainInput = document.getElementById('gain');
+        const debugViewInput = document.getElementById('debug_view');
 
         const exposureVal = document.getElementById('exposure_val');
         const gainVal = document.getElementById('gain_val');
@@ -81,7 +91,8 @@
                 body: JSON.stringify({
                     ae_enable: aeEnableInput.checked,
                     exposure_time: parseInt(exposureTimeInput.value),
-                    analogue_gain: parseFloat(gainInput.value)
+                    analogue_gain: parseFloat(gainInput.value),
+                    debug_view: debugViewInput.value
                 })
             }).catch(err => console.error("Failed to send controls:", err));
         }
@@ -97,6 +108,7 @@
 
         exposureTimeInput.addEventListener('change', sendControls);
         gainInput.addEventListener('change', sendControls);
+        debugViewInput.addEventListener('change', sendControls);
 
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');

@@ -1,5 +1,4 @@
 use crate::apriltag::decode::Homography;
-use crate::apriltag::quad::Point;
 use nalgebra::{Matrix3, Vector3};
 use serde::Serialize;
 
@@ -250,7 +249,7 @@ pub fn orthogonal_iteration(
 /// The main entry point to extract the Tag's 3D Pose
 pub fn estimate_tag_pose(
     homo: &Homography,
-    corners: &[Point; 4],
+    corners: &[[f32; 2]; 4],
     intrinsics: &CameraIntrinsics,
 ) -> Option<Pose> {
     let s = intrinsics.tag_size_mm / 2.0;
@@ -265,8 +264,8 @@ pub fn estimate_tag_pose(
     let mut v = [Vector3::zeros(); 4];
     for i in 0..4 {
         v[i] = Vector3::new(
-            (corners[i].x as f32 - intrinsics.cx) / intrinsics.fx,
-            (corners[i].y as f32 - intrinsics.cy) / intrinsics.fy,
+            (corners[i][0] - intrinsics.cx) / intrinsics.fx,
+            (corners[i][1] - intrinsics.cy) / intrinsics.fy,
             1.0,
         );
     }

@@ -1,226 +1,196 @@
-/// Represents a horizontal run of identical pixels.
+use std::collections::HashMap;
+
+pub struct Cluster {
+    pub id: u64,
+    pub points: Vec<Point>,
+}
+
 #[derive(Debug, Clone, Copy)]
-pub struct Segment {
+pub struct Point {
+    pub x: u16,
     pub y: u16,
-    pub x_start: u16,
-    pub x_end: u16,
-    pub parent: u32,
-    pub size: u32,
+    pub gx: i16,
+    pub gy: i16,
 }
 
-pub struct Blob {
-    pub root_id: u32,
-    pub pixel_count: u32,
-    pub start_idx: usize,
-    pub end_idx: usize,
+/// A pixel-based Union-Find implementation.
+pub struct UnionFind {
+    pub maxid: u32,
+    /// Parent node for each element. Initialized to u32::MAX.
+    pub parent: Vec<u32>,
+    /// The size of the tree excluding the root.
+    pub size: Vec<u32>,
 }
 
-pub struct RleUnionFind {
-    pub segments: Vec<Segment>,
-    prev_row_start: usize,
-    prev_row_end: usize,
-    curr_row_start: usize,
-    current_y: u16,
-}
-
-impl RleUnionFind {
-    pub fn new(capacity: usize) -> Self {
+impl UnionFind {
+    /// Creates a new UnionFind structure capable of holding up to `maxid` elements.
+    pub fn new(maxid: u32) -> Self {
+        let len = (maxid + 1) as usize;
         Self {
-            segments: Vec::with_capacity(capacity),
-            prev_row_start: 0,
-            prev_row_end: 0,
-            curr_row_start: 0,
-            current_y: 0,
+            maxid,
+            parent: vec![u32::MAX; len],
+            size: vec![0; len],
         }
     }
 
-    /// Resets the global state before processing a new camera frame.
+    /// Resets the UnionFind structure so it can be reused without reallocating.
     pub fn clear(&mut self) {
-        self.segments.clear();
-        self.prev_row_start = 0;
-        self.prev_row_end = 0;
-        self.curr_row_start = 0;
-        self.current_y = 0;
+        self.parent.fill(u32::MAX);
+        self.size.fill(0);
     }
 
-    /// Processes a single DMA chunk of a thresholded monochrome image.
-    /// `chunk`: Flat slice of the binary image pixels.
-    /// `width`: Image width (e.g., 640).
-    /// `height`: Number of rows in this specific chunk.
-    /// `y_offset`: The global y-coordinate of the first row in this chunk.
-    pub fn process_chunk(&mut self, chunk: &[u8], width: usize, height: usize, y_offset: usize) {
-        let start_idx = self.segments.len();
+    /// Finds the representative (root) of the set containing `id`.
+    /// Includes "Path Halving" optimization and lazy initialization.
+    pub fn get_representative(&mut self, mut id: u32) -> u32 {
+        let mut idx = id as usize;
 
-        // Step 1: Extract segments for this chunk
-        for local_y in 0..height {
-            let y = (y_offset + local_y) as u16;
-            let row_start = local_y * width;
-            let row = &chunk[row_start..row_start + width];
-
-            let mut in_segment = false;
-            let mut x_start = 0;
-
-            for x in 0..width {
-                let is_active = row[x] == 255;
-
-                if is_active && !in_segment {
-                    x_start = x as u16;
-                    in_segment = true;
-                } else if !is_active && in_segment {
-                    self.push_segment(x_start, (x - 1) as u16, y);
-                    in_segment = false;
-                }
-            }
-
-            if in_segment {
-                self.push_segment(x_start, (width - 1) as u16, y);
-            }
+        if self.parent[idx] == u32::MAX {
+            self.parent[idx] = id;
+            return id;
         }
 
-        // Step 2: Connect the newly added segments, carrying over state from previous chunks
-        for i in start_idx..self.segments.len() {
-            let curr_seg = self.segments[i];
+        while self.parent[idx] != id {
+            let parent_id = self.parent[idx];
+            let grandparent_id = self.parent[parent_id as usize];
 
-            if curr_seg.y > self.current_y {
-                self.prev_row_start = self.curr_row_start;
-                self.prev_row_end = i;
-                self.curr_row_start = i;
-                self.current_y = curr_seg.y;
-            }
+            self.parent[idx] = grandparent_id;
+            id = grandparent_id;
+            idx = id as usize;
+        }
 
-            if curr_seg.y == 0 {
-                continue;
-            }
+        id
+    }
 
-            if self.prev_row_start < self.prev_row_end
-                && self.segments[self.prev_row_start].y == curr_seg.y - 1
-            {
-                while self.prev_row_start < self.prev_row_end
-                    && self.segments[self.prev_row_start].x_end + 1 < curr_seg.x_start
-                {
-                    self.prev_row_start += 1;
+    /// Returns the number of elements in the set containing `id`.
+    pub fn get_set_size(&mut self, id: u32) -> u32 {
+        let repid = self.get_representative(id);
+        self.size[repid as usize] + 1
+    }
+
+    /// Connects (unions) the sets containing `aid` and `bid`.
+    /// Returns the representative of the newly merged set.
+    pub fn connect(&mut self, aid: u32, bid: u32) -> u32 {
+        let aroot = self.get_representative(aid);
+        let broot = self.get_representative(bid);
+
+        if aroot == broot {
+            return aroot;
+        }
+
+        let asize = self.size[aroot as usize] + 1;
+        let bsize = self.size[broot as usize] + 1;
+
+        if asize > bsize {
+            self.parent[broot as usize] = aroot;
+            self.size[aroot as usize] += bsize;
+            aroot
+        } else {
+            self.parent[aroot as usize] = broot;
+            self.size[broot as usize] += asize;
+            broot
+        }
+    }
+
+    /// 4-connected union find on the thresholded image pixels
+    pub fn connected_components(&mut self, im: &[u8], w: usize, h: usize) {
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                let v = im[idx];
+
+                if v == 127 {
+                    continue;
                 }
 
-                let mut j = self.prev_row_start;
-                while j < self.prev_row_end {
-                    let prev_seg = self.segments[j];
+                if x > 0 && im[idx - 1] == v {
+                    self.connect(idx as u32, (idx - 1) as u32);
+                }
+                if y > 0 && im[idx - w] == v {
+                    self.connect(idx as u32, (idx - w) as u32);
+                }
 
-                    if prev_seg.x_start > curr_seg.x_end + 1 {
-                        break;
+                if v == 255 {
+                    if x > 0 && y > 0 && im[idx - w - 1] == v {
+                        self.connect(idx as u32, (idx - w - 1) as u32);
                     }
-
-                    self.union(i as u32, j as u32);
-                    j += 1;
+                    if x + 1 < w && y > 0 && im[idx - w + 1] == v {
+                        self.connect(idx as u32, (idx - w + 1) as u32);
+                    }
                 }
             }
         }
     }
 
-    #[inline(always)]
-    fn push_segment(&mut self, x_start: u16, x_end: u16, y: u16) {
-        let idx = self.segments.len() as u32;
-        self.segments.push(Segment {
-            y,
-            x_start,
-            x_end,
-            parent: idx,
-            size: (x_end - x_start + 1) as u32,
-        });
-    }
+    /// Extract boundary clusters (gradient boundary points)
+    pub fn gradient_clusters(&mut self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
+        let mut map: HashMap<u64, Vec<Point>> = HashMap::new();
 
-    /// Finds the root of a segment's set with Path Compression.
-    pub fn find(&mut self, i: u32) -> u32 {
-        let mut root = i;
-        while root != self.segments[root as usize].parent {
-            root = self.segments[root as usize].parent;
-        }
+        for y in 0..(h - 1) {
+            let mut connected_last = false;
 
-        let mut curr = i;
-        while curr != root {
-            let nxt = self.segments[curr as usize].parent;
-            self.segments[curr as usize].parent = root;
-            curr = nxt;
-        }
-        root
-    }
+            for x in 1..(w - 1) {
+                let idx0 = y * w + x;
+                let v0 = im[idx0];
 
-    /// Unions two disjoint sets by rank/size.
-    pub fn union(&mut self, i: u32, j: u32) {
-        let root_i = self.find(i);
-        let root_j = self.find(j);
-
-        if root_i != root_j {
-            let size_i = self.segments[root_i as usize].size;
-            let size_j = self.segments[root_j as usize].size;
-
-            if size_i < size_j {
-                self.segments[root_i as usize].parent = root_j;
-                self.segments[root_j as usize].size += size_i;
-            } else {
-                self.segments[root_j as usize].parent = root_i;
-                self.segments[root_i as usize].size += size_j;
-            }
-        }
-    }
-
-    /// Step 3: Flatten the tree so every segment points directly to its blob root.
-    /// Call this ONCE after all chunks have been processed.
-    pub fn flatten(&mut self) -> usize {
-        let mut unique_blobs = 0;
-        for i in 0..self.segments.len() {
-            let root = self.find(i as u32);
-            self.segments[i].parent = root;
-            if root == i as u32 {
-                unique_blobs += 1;
-            }
-        }
-        unique_blobs
-    }
-
-    /// Step 4: Group segments into blobs and filter out invalid sizes.
-    /// Returns a list of valid blobs ready for contour tracing.
-    pub fn extract_valid_blobs(&mut self, min_pixels: u32, max_pixels: u32) -> Vec<Blob> {
-        self.segments.sort_unstable_by_key(|s| s.parent);
-
-        let mut valid_blobs = Vec::new();
-        if self.segments.is_empty() {
-            return valid_blobs;
-        }
-
-        let mut current_root = self.segments[0].parent;
-        let mut start_idx = 0;
-        let mut pixel_count = 0;
-
-        for i in 0..self.segments.len() {
-            let seg = self.segments[i];
-
-            if seg.parent != current_root {
-                if pixel_count >= min_pixels && pixel_count <= max_pixels {
-                    valid_blobs.push(Blob {
-                        root_id: current_root,
-                        pixel_count,
-                        start_idx,
-                        end_idx: i,
-                    });
+                if v0 == 127 {
+                    connected_last = false;
+                    continue;
                 }
 
-                current_root = seg.parent;
-                start_idx = i;
-                pixel_count = 0;
+                let rep0 = self.get_representative(idx0 as u32);
+                if self.get_set_size(rep0) < 25 {
+                    connected_last = false;
+                    continue;
+                }
+
+                let mut check_conn = |dx: isize, dy: isize| -> bool {
+                    let nx = (x as isize + dx) as usize;
+                    let ny = (y as isize + dy) as usize;
+                    let idx1 = ny * w + nx;
+                    let v1 = im[idx1];
+
+                    if v1 != 127 && (v0 as u16 + v1 as u16) == 255 {
+                        let rep1 = self.get_representative(idx1 as u32);
+                        if self.get_set_size(rep1) >= 25 {
+                            let clusterid = if rep0 < rep1 {
+                                (rep1 as u64) << 32 | (rep0 as u64)
+                            } else {
+                                (rep0 as u64) << 32 | (rep1 as u64)
+                            };
+
+                            let gx = dx as i16 * (v1 as i16 - v0 as i16);
+                            let gy = dy as i16 * (v1 as i16 - v0 as i16);
+
+                            map.entry(clusterid).or_default().push(Point {
+                                x: (2 * x as isize + dx) as u16,
+                                y: (2 * y as isize + dy) as u16,
+                                gx,
+                                gy,
+                            });
+
+                            return true;
+                        }
+                    }
+                    false
+                };
+
+                let mut connected = false;
+
+                connected |= check_conn(1, 0);
+                connected |= check_conn(0, 1);
+
+                if !connected_last {
+                    connected |= check_conn(-1, 1);
+                }
+
+                connected |= check_conn(1, 1);
+
+                connected_last = connected;
             }
-
-            pixel_count += (seg.x_end - seg.x_start + 1) as u32;
         }
 
-        if pixel_count >= min_pixels && pixel_count <= max_pixels {
-            valid_blobs.push(Blob {
-                root_id: current_root,
-                pixel_count,
-                start_idx,
-                end_idx: self.segments.len(),
-            });
-        }
-
-        valid_blobs
+        map.into_iter()
+            .map(|(id, points)| Cluster { id, points })
+            .collect()
     }
 }
