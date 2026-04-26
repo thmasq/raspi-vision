@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 pub struct Cluster {
@@ -31,6 +32,28 @@ impl UnionFind {
             parent: vec![u32::MAX; len],
             size: vec![0; len],
         }
+    }
+
+    /// Compresses all paths in the tree so lookups are instant
+    pub fn flatten(&mut self) {
+        for i in 0..self.maxid {
+            if self.parent[i as usize] != u32::MAX {
+                self.get_representative(i);
+            }
+        }
+    }
+
+    /// Read-only representative fetcher (Assumes tree is flattened)
+    pub fn get_representative_readonly(&self, mut id: u32) -> u32 {
+        let mut idx = id as usize;
+        if self.parent[idx] == u32::MAX {
+            return id;
+        }
+        while self.parent[idx] != id {
+            id = self.parent[idx];
+            idx = id as usize;
+        }
+        id
     }
 
     /// Resets the UnionFind structure so it can be reused without reallocating.
@@ -122,72 +145,86 @@ impl UnionFind {
     }
 
     /// Extract boundary clusters (gradient boundary points)
-    pub fn gradient_clusters(&mut self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
-        let mut map: FxHashMap<u64, Vec<Point>> = FxHashMap::default();
+    pub fn gradient_clusters(&self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
+        let y_indices: Vec<usize> = (0..(h - 1)).collect();
 
-        for y in 0..(h - 1) {
-            let mut connected_last = false;
+        let map = y_indices
+            .into_par_iter()
+            .fold(
+                || FxHashMap::<u64, Vec<Point>>::default(),
+                |mut local_map, y| {
+                    let mut connected_last = false;
 
-            for x in 1..(w - 1) {
-                let idx0 = y * w + x;
-                let v0 = im[idx0];
+                    for x in 1..(w - 1) {
+                        let idx0 = y * w + x;
+                        let v0 = im[idx0];
 
-                if v0 == 127 {
-                    connected_last = false;
-                    continue;
-                }
-
-                let rep0 = self.get_representative(idx0 as u32);
-                if self.get_set_size(rep0) < 25 {
-                    connected_last = false;
-                    continue;
-                }
-
-                let mut check_conn = |dx: isize, dy: isize| -> bool {
-                    let nx = (x as isize + dx) as usize;
-                    let ny = (y as isize + dy) as usize;
-                    let idx1 = ny * w + nx;
-                    let v1 = im[idx1];
-
-                    if v1 != 127 && (v0 as u16 + v1 as u16) == 255 {
-                        let rep1 = self.get_representative(idx1 as u32);
-                        if self.get_set_size(rep1) >= 25 {
-                            let clusterid = if rep0 < rep1 {
-                                (rep1 as u64) << 32 | (rep0 as u64)
-                            } else {
-                                (rep0 as u64) << 32 | (rep1 as u64)
-                            };
-
-                            let gx = dx as i16 * (v1 as i16 - v0 as i16);
-                            let gy = dy as i16 * (v1 as i16 - v0 as i16);
-
-                            map.entry(clusterid).or_default().push(Point {
-                                x: (2 * x as isize + dx) as u16,
-                                y: (2 * y as isize + dy) as u16,
-                                gx,
-                                gy,
-                            });
-
-                            return true;
+                        if v0 == 127 {
+                            connected_last = false;
+                            continue;
                         }
+
+                        let rep0 = self.get_representative_readonly(idx0 as u32);
+                        let size0 = self.size[rep0 as usize] + 1;
+                        if size0 < 25 {
+                            connected_last = false;
+                            continue;
+                        }
+
+                        let mut check_conn = |dx: isize, dy: isize| -> bool {
+                            let nx = (x as isize + dx) as usize;
+                            let ny = (y as isize + dy) as usize;
+                            let idx1 = ny * w + nx;
+                            let v1 = im[idx1];
+
+                            if v1 != 127 && (v0 as u16 + v1 as u16) == 255 {
+                                let rep1 = self.get_representative_readonly(idx1 as u32);
+                                let size1 = self.size[rep1 as usize] + 1;
+
+                                if size1 >= 25 {
+                                    let clusterid = if rep0 < rep1 {
+                                        (rep1 as u64) << 32 | (rep0 as u64)
+                                    } else {
+                                        (rep0 as u64) << 32 | (rep1 as u64)
+                                    };
+
+                                    let gx = dx as i16 * (v1 as i16 - v0 as i16);
+                                    let gy = dy as i16 * (v1 as i16 - v0 as i16);
+
+                                    local_map.entry(clusterid).or_default().push(Point {
+                                        x: (2 * x as isize + dx) as u16,
+                                        y: (2 * y as isize + dy) as u16,
+                                        gx,
+                                        gy,
+                                    });
+
+                                    return true;
+                                }
+                            }
+                            false
+                        };
+
+                        let mut connected = false;
+                        connected |= check_conn(1, 0);
+                        connected |= check_conn(0, 1);
+                        if !connected_last {
+                            connected |= check_conn(-1, 1);
+                        }
+                        connected |= check_conn(1, 1);
+                        connected_last = connected;
                     }
-                    false
-                };
-
-                let mut connected = false;
-
-                connected |= check_conn(1, 0);
-                connected |= check_conn(0, 1);
-
-                if !connected_last {
-                    connected |= check_conn(-1, 1);
-                }
-
-                connected |= check_conn(1, 1);
-
-                connected_last = connected;
-            }
-        }
+                    local_map
+                },
+            )
+            .reduce(
+                || FxHashMap::default(),
+                |mut map1, map2| {
+                    for (k, mut v) in map2 {
+                        map1.entry(k).or_default().append(&mut v);
+                    }
+                    map1
+                },
+            );
 
         map.into_iter()
             .map(|(id, points)| Cluster { id, points })

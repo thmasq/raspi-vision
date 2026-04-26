@@ -180,11 +180,11 @@ fn capture_loop(
     });
 
     let mut global_uf =
-        crate::apriltag::unionfind::UnionFind::new((STREAM_WIDTH * STREAM_HEIGHT) as u32);
+        crate::apriltag::unionfind::UnionFind::new((CAPTURE_WIDTH * CAPTURE_HEIGHT) as u32);
     let mut mono_image =
-        crate::apriltag::image::Image::new_simd_aligned(STREAM_WIDTH, STREAM_HEIGHT);
+        crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
     let mut threshold_img =
-        crate::apriltag::image::Image::new_simd_aligned(STREAM_WIDTH, STREAM_HEIGHT);
+        crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
     let intrinsics = crate::apriltag::pose::CameraIntrinsics {
         fx: 500.0,
         fy: 500.0,
@@ -197,6 +197,27 @@ fn capture_loop(
         "Starting capture loop at {}x{}...",
         CAPTURE_WIDTH, CAPTURE_HEIGHT
     );
+
+    let mut vga_lut_raw: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
+    for y in 0..STREAM_HEIGHT {
+        let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
+        for x in 0..STREAM_WIDTH {
+            let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
+            vga_lut_raw.push(src_y * capture_stride + src_x);
+        }
+    }
+
+    let mut vga_lut_dense: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
+    for y in 0..STREAM_HEIGHT {
+        let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
+        for x in 0..STREAM_WIDTH {
+            let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
+            vga_lut_dense.push(src_y * CAPTURE_WIDTH + src_x);
+        }
+    }
+
+    let mut stream_bytes = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+    let mut cached_raw_frame = vec![0u8; capture_stride * CAPTURE_HEIGHT];
 
     let mut fps_timer = Instant::now();
     let mut frames_captured = 0;
@@ -222,35 +243,66 @@ fn capture_loop(
         let current_controls = controls_rx.borrow().clone();
 
         if total_frames % STREAM_EVERY_N_FRAMES == 0 {
-            let mut stream_bytes = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
-            for y in 0..STREAM_HEIGHT {
-                let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
-                for x in 0..STREAM_WIDTH {
-                    let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
-                    let src_idx = src_y * capture_stride + src_x;
-                    if src_idx < raw_data.len() {
-                        stream_bytes[y * STREAM_WIDTH + x] = raw_data[src_idx];
-                    }
+            let pipe_start = Instant::now();
+
+            let t_start = Instant::now();
+            let copy_len = cached_raw_frame.len().min(raw_data.len());
+            cached_raw_frame[..copy_len].copy_from_slice(&raw_data[..copy_len]);
+
+            let mono_slice = mono_image.as_mut_slice();
+            if capture_stride == CAPTURE_WIDTH {
+                mono_slice.copy_from_slice(&cached_raw_frame[..CAPTURE_WIDTH * CAPTURE_HEIGHT]);
+            } else {
+                for y in 0..CAPTURE_HEIGHT {
+                    let src_offset = y * capture_stride;
+                    let dst_offset = y * CAPTURE_WIDTH;
+                    mono_slice[dst_offset..dst_offset + CAPTURE_WIDTH]
+                        .copy_from_slice(&cached_raw_frame[src_offset..src_offset + CAPTURE_WIDTH]);
                 }
             }
 
-            mono_image.as_mut_slice().copy_from_slice(&stream_bytes);
-            crate::apriltag::threshold::process(&mono_image, &mut threshold_img);
+            for (dst_pixel, &src_idx) in stream_bytes.iter_mut().zip(&vga_lut_raw) {
+                *dst_pixel = cached_raw_frame[src_idx];
+            }
+            let t_downsample = t_start.elapsed();
 
+            let t_start = Instant::now();
+            crate::apriltag::threshold::process(&mono_image, &mut threshold_img);
+            let t_thresh = t_start.elapsed();
+
+            let t_start = Instant::now();
             global_uf.clear();
-            global_uf.connected_components(threshold_img.as_slice(), STREAM_WIDTH, STREAM_HEIGHT);
-            let clusters =
-                global_uf.gradient_clusters(threshold_img.as_slice(), STREAM_WIDTH, STREAM_HEIGHT);
+            global_uf.connected_components(threshold_img.as_slice(), CAPTURE_WIDTH, CAPTURE_HEIGHT);
+            global_uf.flatten();
+            let t_uf = t_start.elapsed();
+
+            let t_start = Instant::now();
+            let clusters = global_uf.gradient_clusters(
+                threshold_img.as_slice(),
+                CAPTURE_WIDTH,
+                CAPTURE_HEIGHT,
+            );
+            let t_cluster = t_start.elapsed();
 
             let debug_frame = match current_controls.debug_view {
-                DebugView::Raw => stream_bytes,
-                DebugView::Threshold => threshold_img.as_slice().to_vec(),
+                DebugView::Raw => stream_bytes.clone(),
+                DebugView::Threshold => {
+                    let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+                    let thresh_slice = threshold_img.as_slice();
+                    for (dst, &src_idx) in buf.iter_mut().zip(&vga_lut_dense) {
+                        *dst = thresh_slice[src_idx];
+                    }
+                    buf
+                }
                 DebugView::Segments => {
                     let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+                    let scale_x = CAPTURE_WIDTH as f32 / STREAM_WIDTH as f32;
+                    let scale_y = CAPTURE_HEIGHT as f32 / STREAM_HEIGHT as f32;
+
                     for cluster in &clusters {
                         for pt in &cluster.points {
-                            let px = (pt.x / 2) as usize;
-                            let py = (pt.y / 2) as usize;
+                            let px = (pt.x as f32 / scale_x) as usize;
+                            let py = (pt.y as f32 / scale_y) as usize;
                             let idx = py * STREAM_WIDTH + px;
                             if idx < buf.len() {
                                 buf[idx] = 255;
@@ -263,6 +315,7 @@ fn capture_loop(
 
             let _ = tx_video.send(debug_frame);
 
+            let t_start = Instant::now();
             let valid_detections: Vec<_> = clusters
                 .par_iter()
                 .filter_map(|cluster| {
@@ -270,6 +323,14 @@ fn capture_loop(
                     crate::apriltag::decode::extract_detection(&mono_image, &corners, &intrinsics)
                 })
                 .collect();
+            let t_decode = t_start.elapsed();
+
+            let total_pipe = pipe_start.elapsed();
+
+            println!(
+                "Pipe: {:?} | Prep: {:?}, Thresh: {:?}, UF: {:?}, Cluster: {:?}, Decode: {:?}",
+                total_pipe, t_downsample, t_thresh, t_uf, t_cluster, t_decode
+            );
 
             let top_detections: Vec<_> = valid_detections.into_iter().take(10).collect();
             if !top_detections.is_empty() {
