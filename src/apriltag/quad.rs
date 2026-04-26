@@ -241,8 +241,32 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
 }
 
 /// Precomputes cumulative moments. Equivalent to `compute_lfps` in C.
+/// Vectorization-friendly moment computation
 fn compute_lfps(pts: &[FitPoint]) -> Vec<LineFitPt> {
-    let mut lfps = Vec::with_capacity(pts.len());
+    let len = pts.len();
+    let mut lfps = Vec::with_capacity(len);
+
+    let mut w_x = vec![0.0; len];
+    let mut w_y = vec![0.0; len];
+    let mut w_xx = vec![0.0; len];
+    let mut w_yy = vec![0.0; len];
+    let mut w_xy = vec![0.0; len];
+    let mut weights = vec![0.0; len];
+
+    for i in 0..len {
+        let p = &pts[i];
+        let x = p.x * 0.5 + 0.5;
+        let y = p.y * 0.5 + 0.5;
+        let w = (p.gx * p.gx + p.gy * p.gy).sqrt() + 1.0;
+
+        weights[i] = w;
+        w_x[i] = w * x;
+        w_y[i] = w * y;
+        w_xx[i] = w * x * x;
+        w_yy[i] = w * y * y;
+        w_xy[i] = w * x * y;
+    }
+
     let mut sum_mx = 0.0;
     let mut sum_my = 0.0;
     let mut sum_mxx = 0.0;
@@ -250,18 +274,13 @@ fn compute_lfps(pts: &[FitPoint]) -> Vec<LineFitPt> {
     let mut sum_mxy = 0.0;
     let mut sum_w = 0.0;
 
-    for p in pts {
-        let x = p.x * 0.5 + 0.5;
-        let y = p.y * 0.5 + 0.5;
-
-        let w = (p.gx * p.gx + p.gy * p.gy).sqrt() + 1.0;
-
-        sum_mx += w * x;
-        sum_my += w * y;
-        sum_mxx += w * x * x;
-        sum_myy += w * y * y;
-        sum_mxy += w * x * y;
-        sum_w += w;
+    for i in 0..len {
+        sum_mx += w_x[i];
+        sum_my += w_y[i];
+        sum_mxx += w_xx[i];
+        sum_myy += w_yy[i];
+        sum_mxy += w_xy[i];
+        sum_w += weights[i];
 
         lfps.push(LineFitPt {
             mx: sum_mx,

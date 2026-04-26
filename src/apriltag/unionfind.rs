@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 pub struct Cluster {
     pub id: u64,
@@ -123,7 +123,7 @@ impl UnionFind {
 
     /// Extract boundary clusters (gradient boundary points)
     pub fn gradient_clusters(&mut self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
-        let mut map: HashMap<u64, Vec<Point>> = HashMap::new();
+        let mut map: FxHashMap<u64, Vec<Point>> = FxHashMap::default();
 
         for y in 0..(h - 1) {
             let mut connected_last = false;

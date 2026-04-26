@@ -12,6 +12,7 @@ use axum::{
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::{camera_manager::CameraManager, controls, formats};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -262,25 +263,17 @@ fn capture_loop(
 
             let _ = tx_video.send(debug_frame);
 
-            let mut valid_detections = Vec::new();
+            let valid_detections: Vec<_> = clusters
+                .par_iter()
+                .filter_map(|cluster| {
+                    let corners = crate::apriltag::quad::find_quad_corners(cluster)?;
+                    crate::apriltag::decode::extract_detection(&mono_image, &corners, &intrinsics)
+                })
+                .collect();
 
-            for cluster in &clusters {
-                if let Some(corners) = crate::apriltag::quad::find_quad_corners(cluster) {
-                    if let Some(detection) = crate::apriltag::decode::extract_detection(
-                        &mono_image,
-                        &corners,
-                        &intrinsics,
-                    ) {
-                        valid_detections.push(detection);
-                        if valid_detections.len() >= 10 {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !valid_detections.is_empty() {
-                if let Ok(json) = serde_json::to_string(&valid_detections) {
+            let top_detections: Vec<_> = valid_detections.into_iter().take(10).collect();
+            if !top_detections.is_empty() {
+                if let Ok(json) = serde_json::to_string(&top_detections) {
                     let _ = tx_tags.send(json);
                 }
             }
