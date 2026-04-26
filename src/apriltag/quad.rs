@@ -7,14 +7,23 @@ pub struct Point {
     pub slope: f32,
 }
 
+/// Stores cumulative moments for O(1) line fitting queries.
+/// Equivalent to `struct line_fit_pt` in the C library.
+#[derive(Default, Clone, Copy)]
+pub struct LineFitPt {
+    pub mx: f64,
+    pub my: f64,
+    pub mxx: f64,
+    pub myy: f64,
+    pub mxy: f64,
+    pub w: f64,
+}
+
 /// Extracts the boundary points from a blob's RLE segments and orders them
 /// clockwise around the centroid of the blob.
 pub fn extract_ordered_boundary(blob: &Blob, segments: &[Segment]) -> Vec<Point> {
     let expected_perimeter = (blob.pixel_count as f32).sqrt() as usize * 4;
     let mut boundary = Vec::with_capacity(expected_perimeter);
-
-    let mut sum_x: u32 = 0;
-    let mut sum_y: u32 = 0;
 
     let blob_segments = &segments[blob.start_idx..blob.end_idx];
 
@@ -31,158 +40,234 @@ pub fn extract_ordered_boundary(blob: &Blob, segments: &[Segment]) -> Vec<Point>
         };
 
         boundary.push(left);
-        sum_x += seg.x_start as u32;
-        sum_y += seg.y as u32;
-
         if seg.x_start != seg.x_end {
             boundary.push(right);
-            sum_x += seg.x_end as u32;
-            sum_y += seg.y as u32;
         }
     }
 
-    let n = boundary.len() as f32;
-    if n < 8.0 {
+    if boundary.is_empty() {
         return boundary;
     }
 
-    let cx = (sum_x as f32) / n;
-    let cy = (sum_y as f32) / n;
+    let mut xmax = boundary[0].x;
+    let mut xmin = boundary[0].x;
+    let mut ymax = boundary[0].y;
+    let mut ymin = boundary[0].y;
 
-    for pt in boundary.iter_mut() {
-        let dx = pt.x - cx;
-        let dy = pt.y - cy;
-
-        let quadrant = if dy > 0.0 {
-            if dx > 0.0 { 0.0 } else { 1.0 }
-        } else {
-            if dx < 0.0 { 2.0 } else { 3.0 }
-        };
-
-        let slope = if dx.abs() > 1e-5 {
-            dy / dx
-        } else {
-            9999.0 * dy.signum()
-        };
-        pt.slope = quadrant * 1000.0 + slope;
+    for p in &boundary {
+        if p.x > xmax {
+            xmax = p.x;
+        } else if p.x < xmin {
+            xmin = p.x;
+        }
+        if p.y > ymax {
+            ymax = p.y;
+        } else if p.y < ymin {
+            ymin = p.y;
+        }
     }
 
-    // sort_unstable_by is highly optimized in the standard library
-    boundary.sort_unstable_by(|a, b| a.slope.partial_cmp(&b.slope).unwrap());
+    let cx = (xmin + xmax) * 0.5 + 0.05118;
+    let cy = (ymin + ymax) * 0.5 - 0.028581;
 
+    for pt in boundary.iter_mut() {
+        let mut dx = pt.x - cx;
+        let mut dy = pt.y - cy;
+
+        let dy_gt_0 = dy > 0.0;
+        let dx_gt_0 = dx > 0.0;
+
+        let quadrant = match (dy_gt_0, dx_gt_0) {
+            (false, false) => -131072.0,
+            (false, true) => 0.0,
+            (true, false) => 131072.0,
+            (true, true) => 65536.0,
+        };
+
+        if dy < 0.0 {
+            dy = -dy;
+            dx = -dx;
+        }
+        if dx < 0.0 {
+            let tmp = dx;
+            dx = dy;
+            dy = -tmp;
+        }
+        pt.slope = quadrant + (dy / dx);
+    }
+
+    boundary.sort_unstable_by(|a, b| a.slope.partial_cmp(&b.slope).unwrap());
     boundary
 }
 
-/// Fits a 2D line to a subset of boundary points.
-/// Returns: (MeanX, MeanY, NormalX, NormalY, MeanSquaredError)
-pub fn fit_line(points: &[Point]) -> Option<(f32, f32, f32, f32, f32)> {
-    let n = points.len() as f32;
-    if n < 2.0 {
-        return None;
+/// Precomputes cumulative moments. Equivalent to `compute_lfps` in C.
+fn compute_lfps(boundary: &[Point]) -> Vec<LineFitPt> {
+    let mut lfps = Vec::with_capacity(boundary.len());
+    let mut sum_mx = 0.0;
+    let mut sum_my = 0.0;
+    let mut sum_mxx = 0.0;
+    let mut sum_myy = 0.0;
+    let mut sum_mxy = 0.0;
+    let mut sum_w = 0.0;
+
+    for p in boundary {
+        let x = p.x as f64;
+        let y = p.y as f64;
+        let w = 1.0;
+
+        sum_mx += w * x;
+        sum_my += w * y;
+        sum_mxx += w * x * x;
+        sum_myy += w * y * y;
+        sum_mxy += w * x * y;
+        sum_w += w;
+
+        lfps.push(LineFitPt {
+            mx: sum_mx,
+            my: sum_my,
+            mxx: sum_mxx,
+            myy: sum_myy,
+            mxy: sum_mxy,
+            w: sum_w,
+        });
     }
-
-    // 1. Calculate Mean
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    for p in points {
-        sum_x += p.x;
-        sum_y += p.y;
-    }
-    let ex = sum_x / n;
-    let ey = sum_y / n;
-
-    // 2. Calculate Covariance Matrix Elements
-    // LLVM will automatically vectorize this loop using ARM NEON
-    let mut cxx = 0.0;
-    let mut cyy = 0.0;
-    let mut cxy = 0.0;
-    for p in points {
-        let dx = p.x - ex;
-        let dy = p.y - ey;
-        cxx += dx * dx;
-        cyy += dy * dy;
-        cxy += dx * dy;
-    }
-    cxx /= n;
-    cyy /= n;
-    cxy /= n;
-
-    // 3. Analytic Eigendecomposition of the 2x2 Covariance Matrix
-    let trace = cxx + cyy;
-    let det = cxx * cyy - cxy * cxy;
-
-    let discriminant = ((trace * trace) / 4.0 - det).abs().sqrt();
-    let eig_small = (trace / 2.0) - discriminant;
-    let eig_large = (trace / 2.0) + discriminant;
-
-    let mut nx = cxx - eig_large;
-    let mut ny = cxy;
-    let length = (nx * nx + ny * ny).sqrt();
-
-    if length > 1e-6 {
-        nx /= length;
-        ny /= length;
-    } else {
-        nx = 0.0;
-        ny = 0.0;
-    }
-
-    Some((ex, ey, nx, ny, eig_small))
+    lfps
 }
 
-/// Finds the 4 mathematical sub-pixel corners of an AprilTag quad
-/// from an ordered boundary of points.
+/// Fits a line to points [i0, i1] (inclusive) using cumulative moments in O(1).
+/// Returns: (Ex, Ey, nx, ny, err, mse)
+fn fit_line(lfps: &[LineFitPt], sz: usize, i0: usize, i1: usize) -> (f32, f32, f32, f32, f32, f32) {
+    let (mx, my, mxx, myy, mxy, w);
+    let n;
+
+    if i0 <= i1 {
+        n = (i1 - i0 + 1) as f64;
+        let mut tmp_mx = lfps[i1].mx;
+        let mut tmp_my = lfps[i1].my;
+        let mut tmp_mxx = lfps[i1].mxx;
+        let mut tmp_mxy = lfps[i1].mxy;
+        let mut tmp_myy = lfps[i1].myy;
+        let mut tmp_w = lfps[i1].w;
+
+        if i0 > 0 {
+            tmp_mx -= lfps[i0 - 1].mx;
+            tmp_my -= lfps[i0 - 1].my;
+            tmp_mxx -= lfps[i0 - 1].mxx;
+            tmp_mxy -= lfps[i0 - 1].mxy;
+            tmp_myy -= lfps[i0 - 1].myy;
+            tmp_w -= lfps[i0 - 1].w;
+        }
+        mx = tmp_mx;
+        my = tmp_my;
+        mxx = tmp_mxx;
+        mxy = tmp_mxy;
+        myy = tmp_myy;
+        w = tmp_w;
+    } else {
+        n = (sz - i0 + i1 + 1) as f64;
+        mx = lfps[sz - 1].mx - lfps[i0 - 1].mx + lfps[i1].mx;
+        my = lfps[sz - 1].my - lfps[i0 - 1].my + lfps[i1].my;
+        mxx = lfps[sz - 1].mxx - lfps[i0 - 1].mxx + lfps[i1].mxx;
+        mxy = lfps[sz - 1].mxy - lfps[i0 - 1].mxy + lfps[i1].mxy;
+        myy = lfps[sz - 1].myy - lfps[i0 - 1].myy + lfps[i1].myy;
+        w = lfps[sz - 1].w - lfps[i0 - 1].w + lfps[i1].w;
+    }
+
+    let n = n as f32;
+    let mx = mx as f32;
+    let my = my as f32;
+    let mxx = mxx as f32;
+    let myy = myy as f32;
+    let mxy = mxy as f32;
+    let w = w as f32;
+
+    let ex = mx / w;
+    let ey = my / w;
+    let cxx = mxx / w - ex * ex;
+    let cxy = mxy / w - ex * ey;
+    let cyy = myy / w - ey * ey;
+
+    let eig_small = 0.5 * (cxx + cyy - ((cxx - cyy) * (cxx - cyy) + 4.0 * cxy * cxy).sqrt());
+    let eig_large = 0.5 * (cxx + cyy + ((cxx - cyy) * (cxx - cyy) + 4.0 * cxy * cxy).sqrt());
+
+    let nx1 = cxx - eig_large;
+    let ny1 = cxy;
+    let m1 = nx1 * nx1 + ny1 * ny1;
+
+    let nx2 = cxy;
+    let ny2 = cyy - eig_large;
+    let m2 = nx2 * nx2 + ny2 * ny2;
+
+    let (mut nx, mut ny, m) = if m1 > m2 {
+        (nx1, ny1, m1)
+    } else {
+        (nx2, ny2, m2)
+    };
+
+    let length = m.sqrt();
+    if length.abs() < 1e-12 {
+        nx = 0.0;
+        ny = 0.0;
+    } else {
+        nx /= length;
+        ny /= length;
+    }
+
+    let err = n * eig_small;
+    let mse = eig_small;
+
+    (ex, ey, nx, ny, err, mse)
+}
+
+/// Finds the 4 mathematical sub-pixel corners of an AprilTag quad.
+/// Replicates `quad_segment_maxima` and line intersections.
 pub fn find_quad_corners(boundary: &[Point]) -> Option<[Point; 4]> {
     let sz = boundary.len();
     if sz < 24 {
         return None;
     }
 
-    // The kernel size dictates how many points on either side of the target are used to fit the line.
     let ksz = 20.min(sz / 12);
     if ksz < 2 {
         return None;
     }
 
-    let mut errs = Vec::with_capacity(sz);
-    let mut window_buf = Vec::with_capacity(ksz * 2 + 1);
+    let lfps = compute_lfps(boundary);
+    let mut errs = vec![0.0; sz];
 
     for i in 0..sz {
-        window_buf.clear();
-
-        for k in 0..=(ksz * 2) {
-            let idx = (i + sz + k - ksz) % sz;
-            window_buf.push(boundary[idx]);
-        }
-
-        if let Some((_, _, _, _, mse)) = fit_line(&window_buf) {
-            errs.push(mse);
-        } else {
-            errs.push(0.0);
-        }
+        let (_, _, _, _, err, _) = fit_line(&lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz);
+        errs[i] = err;
     }
 
-    let mut smoothed_errs = Vec::with_capacity(sz);
-    for i in 0..sz {
-        let prev2 = errs[(i + sz - 2) % sz];
-        let prev1 = errs[(i + sz - 1) % sz];
-        let curr = errs[i];
-        let next1 = errs[(i + 1) % sz];
-        let next2 = errs[(i + 2) % sz];
+    let sigma = 1.0_f32;
+    let cutoff = 0.05_f32;
+    let mut fsz = (-cutoff.ln() * 2.0 * sigma * sigma).sqrt() as i32 + 1;
+    fsz = 2 * fsz + 1;
 
-        // 1-4-6-4-1 kernel approximation
-        let smoothed = (prev2 + 4.0 * prev1 + 6.0 * curr + 4.0 * next1 + next2) / 16.0;
-        smoothed_errs.push(smoothed);
+    let mut f = Vec::with_capacity(fsz as usize);
+    for i in 0..fsz {
+        let j = (i - fsz / 2) as f32;
+        f.push((-j * j / (2.0 * sigma * sigma)).exp());
     }
 
-    let mut maxima = Vec::with_capacity(16);
-    for i in 0..sz {
-        let prev = smoothed_errs[(i + sz - 1) % sz];
-        let curr = smoothed_errs[i];
-        let next = smoothed_errs[(i + 1) % sz];
+    let mut y_errs = vec![0.0; sz];
+    for iy in 0..sz {
+        let mut acc = 0.0;
+        for i in 0..fsz {
+            let idx = (iy as i32 + i - fsz / 2 + sz as i32) % (sz as i32);
+            acc += errs[idx as usize] * f[i as usize];
+        }
+        y_errs[iy] = acc;
+    }
+    errs = y_errs;
 
-        if curr > prev && curr > next {
+    let mut maxima = Vec::new();
+    let mut maxima_errs = Vec::new();
+    for i in 0..sz {
+        if errs[i] > errs[(i + 1) % sz] && errs[i] > errs[(i + sz - 1) % sz] {
             maxima.push(i);
+            maxima_errs.push(errs[i]);
         }
     }
 
@@ -190,46 +275,94 @@ pub fn find_quad_corners(boundary: &[Point]) -> Option<[Point; 4]> {
         return None;
     }
 
-    if maxima.len() > 4 {
-        maxima.sort_unstable_by(|&a, &b| smoothed_errs[b].partial_cmp(&smoothed_errs[a]).unwrap());
-        maxima.truncate(4);
-    }
+    let max_nmaxima = 10;
+    if maxima.len() > max_nmaxima {
+        let mut indices: Vec<usize> = (0..maxima.len()).collect();
+        indices.sort_unstable_by(|&a, &b| maxima_errs[b].partial_cmp(&maxima_errs[a]).unwrap());
 
-    maxima.sort_unstable();
-
-    // 1. Fit 4 continuous lines using the discrete points between our 4 maxima
-    let mut lines = [(0.0, 0.0, 0.0, 0.0); 4]; // (Ex, Ey, nx, ny)
-    for i in 0..4 {
-        let start_idx = maxima[i];
-        let end_idx = maxima[(i + 1) % 4];
-
-        let mut edge_points = Vec::new();
-        let mut curr = start_idx;
-        loop {
-            edge_points.push(boundary[curr]);
-            if curr == end_idx {
-                break;
+        let threshold = maxima_errs[indices[max_nmaxima]];
+        let mut best_maxima = Vec::new();
+        for i in 0..maxima.len() {
+            if maxima_errs[i] > threshold {
+                best_maxima.push(maxima[i]);
             }
-            curr = (curr + 1) % sz;
         }
+        maxima = best_maxima;
+    }
 
-        if let Some((ex, ey, nx, ny, _)) = fit_line(&edge_points) {
-            lines[i] = (ex, ey, nx, ny);
-        } else {
-            return None;
+    let nmaxima = maxima.len();
+    let mut best_indices = [0; 4];
+    let mut best_error = f32::INFINITY;
+    let max_dot = (25.0_f32 * std::f32::consts::PI / 180.0).cos();
+    let max_line_fit_mse = 10.0_f32;
+
+    for m0 in 0..(nmaxima.saturating_sub(3)) {
+        let i0 = maxima[m0];
+        for m1 in (m0 + 1)..(nmaxima.saturating_sub(2)) {
+            let i1 = maxima[m1];
+            let (_, _, nx01, ny01, err01, mse01) = fit_line(&lfps, sz, i0, i1);
+            if mse01 > max_line_fit_mse {
+                continue;
+            }
+
+            for m2 in (m1 + 1)..(nmaxima.saturating_sub(1)) {
+                let i2 = maxima[m2];
+                let (_, _, nx12, ny12, err12, mse12) = fit_line(&lfps, sz, i1, i2);
+                if mse12 > max_line_fit_mse {
+                    continue;
+                }
+
+                let dot = nx01 * nx12 + ny01 * ny12;
+                if dot.abs() > max_dot {
+                    continue;
+                }
+
+                for m3 in (m2 + 1)..nmaxima {
+                    let i3 = maxima[m3];
+                    let (_, _, _, _, err23, mse23) = fit_line(&lfps, sz, i2, i3);
+                    if mse23 > max_line_fit_mse {
+                        continue;
+                    }
+
+                    let (_, _, _, _, err30, mse30) = fit_line(&lfps, sz, i3, i0);
+                    if mse30 > max_line_fit_mse {
+                        continue;
+                    }
+
+                    let err = err01 + err12 + err23 + err30;
+
+                    if err < best_error {
+                        best_error = err;
+                        best_indices = [i0, i1, i2, i3];
+                    }
+                }
+            }
         }
     }
 
-    // 2. Intersect the 4 lines to calculate the exact sub-pixel corners
+    if best_error == f32::INFINITY {
+        return None;
+    }
+    if best_error / (sz as f32) >= max_line_fit_mse {
+        return None;
+    }
+
+    let mut lines = [(0.0, 0.0, 0.0, 0.0); 4];
+    for i in 0..4 {
+        let i0 = best_indices[i];
+        let i1 = best_indices[(i + 1) & 3];
+        let (ex, ey, nx, ny, _, _) = fit_line(&lfps, sz, i0, i1);
+        lines[i] = (ex, ey, nx, ny);
+    }
+
     let mut exact_corners = [Point {
         x: 0.0,
         y: 0.0,
         slope: 0.0,
     }; 4];
-
     for i in 0..4 {
         let (p0_x, p0_y, n0_x, n0_y) = lines[i];
-        let (p1_x, p1_y, n1_x, n1_y) = lines[(i + 1) % 4];
+        let (p1_x, p1_y, n1_x, n1_y) = lines[(i + 1) & 3];
 
         let a00 = n0_y;
         let a01 = -n1_y;
@@ -249,8 +382,8 @@ pub fn find_quad_corners(boundary: &[Point]) -> Option<[Point; 4]> {
         let l0 = w00 * b0 + w01 * b1;
 
         exact_corners[i] = Point {
-            x: p0_x + l0 * a00,
-            y: p0_y + l0 * a10,
+            x: (p0_x + l0 * a00) as f32,
+            y: (p0_y + l0 * a10) as f32,
             slope: 0.0,
         };
     }
