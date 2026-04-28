@@ -86,7 +86,7 @@ pub fn process(input: &Image, output: &mut Image) {
                         if contrast < MIN_CONTRAST {
                             out_row[j] = 0;
                         } else {
-                            out_row[j] = if (in_row[j] as u16) < thresh { 255 } else { 0 };
+                            out_row[j] = if (in_row[j] as u16) > thresh { 255 } else { 0 };
                         }
                     }
                 }

@@ -1,4 +1,4 @@
-use crate::apriltag::unionfind::Cluster;
+use crate::apriltag::{image::Image, unionfind::Cluster};
 
 #[derive(Debug, Clone, Copy)]
 struct FitPoint {
@@ -369,4 +369,152 @@ fn fit_line(lfps: &[LineFitPt], sz: usize, i0: usize, i1: usize) -> (f64, f64, f
     let mse = eig_small;
 
     (ex, ey, nx, ny, err, mse)
+}
+
+/// A lightweight bilinear sampler for edge refinement
+#[inline(always)]
+fn sample_pixel_bilinear(image: &Image, x: f32, y: f32) -> Option<f32> {
+    let x0 = x.trunc() as i32;
+    let y0 = y.trunc() as i32;
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
+
+    if x0 < 0 || y0 < 0 || x1 >= image.width as i32 || y1 >= image.height as i32 {
+        return None;
+    }
+
+    let a = x.fract();
+    let b = y.fract();
+
+    let r0 = image.row(y0 as usize);
+    let r1 = image.row(y1 as usize);
+
+    let v00 = r0[x0 as usize] as f32;
+    let v10 = r0[x1 as usize] as f32;
+    let v01 = r1[x0 as usize] as f32;
+    let v11 = r1[x1 as usize] as f32;
+
+    Some((1.0 - a) * (1.0 - b) * v00 + a * (1.0 - b) * v10 + (1.0 - a) * b * v01 + a * b * v11)
+}
+
+/// Refines the edges of a quadrilateral by sampling local image gradients.
+/// Adjusts the `corners` in-place.
+pub fn refine_edges(image: &Image, corners: &mut [[f32; 2]; 4]) {
+    let mut lines = [[0.0f32; 4]; 4];
+
+    for edge in 0..4 {
+        let a = edge;
+        let b = (edge + 1) & 3;
+
+        let mut nx = corners[b][1] - corners[a][1];
+        let mut ny = -corners[b][0] + corners[a][0];
+
+        let mag = (nx * nx + ny * ny).sqrt();
+        if mag < 1e-5 {
+            continue;
+        }
+        nx /= mag;
+        ny /= mag;
+
+        let nsamples = 16.max((mag / 8.0) as usize);
+
+        let mut mx = 0.0;
+        let mut my = 0.0;
+        let mut mxx = 0.0;
+        let mut mxy = 0.0;
+        let mut myy = 0.0;
+        let mut n = 0.0;
+
+        for s in 0..nsamples {
+            let alpha = (1 + s) as f32 / (nsamples + 1) as f32;
+            let x0 = alpha * corners[a][0] + (1.0 - alpha) * corners[b][0];
+            let y0 = alpha * corners[a][1] + (1.0 - alpha) * corners[b][1];
+
+            let mut mn = 0.0;
+            let mut m_count = 0.0;
+
+            const RANGE: f32 = 2.0;
+            const STEPS_PER_UNIT: usize = 4;
+            const STEP_LENGTH: f32 = 1.0 / STEPS_PER_UNIT as f32;
+            const MAX_STEPS: usize = 2 * STEPS_PER_UNIT * RANGE as usize + 1;
+            const DELTA: f32 = 0.5;
+            const GRANGE: f32 = 1.0;
+
+            for step in 0..MAX_STEPS {
+                let dist = -RANGE + STEP_LENGTH * step as f32;
+
+                let x1 = x0 + (dist + GRANGE) * nx - DELTA;
+                let y1 = y0 + (dist + GRANGE) * ny - DELTA;
+
+                let x2 = x0 + (dist - GRANGE) * nx - DELTA;
+                let y2 = y0 + (dist - GRANGE) * ny - DELTA;
+
+                if let (Some(g1), Some(g2)) = (
+                    sample_pixel_bilinear(image, x1, y1),
+                    sample_pixel_bilinear(image, x2, y2),
+                ) {
+                    if g1 < g2 {
+                        continue;
+                    }
+
+                    let weight = (g2 - g1).powi(2);
+
+                    mn += weight * dist;
+                    m_count += weight;
+                }
+            }
+
+            if m_count > 0.0 {
+                let n0 = mn / m_count;
+                let best_x = x0 + n0 * nx;
+                let best_y = y0 + n0 * ny;
+
+                mx += best_x;
+                my += best_y;
+                mxx += best_x * best_x;
+                mxy += best_x * best_y;
+                myy += best_y * best_y;
+                n += 1.0;
+            }
+        }
+
+        if n < 2.0 {
+            lines[edge] = [
+                (corners[a][0] + corners[b][0]) / 2.0,
+                (corners[a][1] + corners[b][1]) / 2.0,
+                nx,
+                ny,
+            ];
+            continue;
+        }
+
+        let ex = mx / n;
+        let ey = my / n;
+        let cxx = mxx / n - ex * ex;
+        let cxy = mxy / n - ex * ey;
+        let cyy = myy / n - ey * ey;
+
+        let normal_theta = 0.5 * (-2.0 * cxy).atan2(cyy - cxx);
+        lines[edge] = [ex, ey, normal_theta.cos(), normal_theta.sin()];
+    }
+
+    for i in 0..4 {
+        let a00 = lines[i][3];
+        let a01 = -lines[(i + 1) & 3][3];
+        let a10 = -lines[i][2];
+        let a11 = lines[(i + 1) & 3][2];
+        let b0 = -lines[i][0] + lines[(i + 1) & 3][0];
+        let b1 = -lines[i][1] + lines[(i + 1) & 3][1];
+
+        let det = a00 * a11 - a10 * a01;
+
+        if det.abs() > 0.001 {
+            let w00 = a11 / det;
+            let w01 = -a01 / det;
+            let l0 = w00 * b0 + w01 * b1;
+
+            corners[(i + 1) & 3][0] = lines[i][0] + l0 * a00;
+            corners[(i + 1) & 3][1] = lines[i][1] + l0 * a10;
+        }
+    }
 }

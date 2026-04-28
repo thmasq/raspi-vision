@@ -1,5 +1,6 @@
 use crate::apriltag::image::Image;
 use crate::apriltag::pose::{CameraIntrinsics, estimate_tag_pose};
+use crate::apriltag::quad::refine_edges;
 use nalgebra::{SMatrix, SVector};
 use serde::Serialize;
 
@@ -608,6 +609,68 @@ pub const TAG36H11_CODES: [u64; 587] = [
     0x0000000e8b772fe0,
 ];
 
+/// A lookup table for O(1) candidate generation based on the pigeonhole principle.
+pub struct QuickDecode {
+    chunk_offsets: [[u16; 513]; 4],
+    chunk_ids: [[u16; 587]; 4],
+}
+
+impl QuickDecode {
+    /// Builds the LUT. This should be called exactly ONCE at application startup.
+    pub fn new() -> Self {
+        let mut offsets = [[0u16; 513]; 4];
+        let mut ids = [[0u16; 587]; 4];
+
+        for &code in TAG36H11_CODES.iter() {
+            for i in 0..4 {
+                let val = ((code >> (i * 9)) & 0x1FF) as usize;
+                offsets[i][val + 1] += 1;
+            }
+        }
+
+        for i in 0..4 {
+            for j in 0..512 {
+                offsets[i][j + 1] += offsets[i][j];
+            }
+        }
+
+        let mut cursors = offsets.clone();
+        for (id, &code) in TAG36H11_CODES.iter().enumerate() {
+            for i in 0..4 {
+                let val = ((code >> (i * 9)) & 0x1FF) as usize;
+                let write_pos = cursors[i][val] as usize;
+                ids[i][write_pos] = id as u16;
+                cursors[i][val] += 1;
+            }
+        }
+
+        Self {
+            chunk_offsets: offsets,
+            chunk_ids: ids,
+        }
+    }
+
+    /// Decodes a 36-bit payload, returning (TagID, HammingDistance) if found.
+    pub fn decode(&self, observed_code: u64) -> Option<(u16, u8)> {
+        for i in 0..4 {
+            let val = ((observed_code >> (i * 9)) & 0x1FF) as usize;
+
+            let start = self.chunk_offsets[i][val] as usize;
+            let end = self.chunk_offsets[i][val + 1] as usize;
+
+            for &id in &self.chunk_ids[i][start..end] {
+                let perfect_code = TAG36H11_CODES[id as usize];
+                let dist = (observed_code ^ perfect_code).count_ones() as u8;
+
+                if dist <= TAG36H11_MAX_HAMMING as u8 {
+                    return Some((id, dist));
+                }
+            }
+        }
+        None
+    }
+}
+
 /// The final output of the AprilTag pipeline.
 /// `repr(C, packed)` ensures it can be safely passed over FFI or DMA to other system components.
 #[repr(C, packed)]
@@ -747,35 +810,16 @@ fn rotate90(w: u64) -> u64 {
     ((w << 9) | (w >> 27)) & 0x0F_FFFF_FFFF
 }
 
-/// Matches the payload against the known 36h11 dictionary.
+/// Matches the payload using the O(1) QuickDecode table.
 /// Returns (TagID, HammingDistance, RotationIndex)
-fn match_payload(mut payload: u64) -> Option<(u16, u8, u8)> {
-    let mut best_id = 0;
-    let mut best_hamming = 255;
-    let mut best_rotation = 0;
-
+fn match_payload(quick_decode: &QuickDecode, mut payload: u64) -> Option<(u16, u8, u8)> {
     for rotation in 0..4 {
-        for (id, &reference_code) in TAG36H11_CODES.iter().enumerate() {
-            let hamming = (payload ^ reference_code).count_ones();
-
-            if hamming < best_hamming {
-                best_hamming = hamming;
-                best_id = id as u16;
-                best_rotation = rotation;
-
-                if hamming == 0 {
-                    return Some((best_id, 0, best_rotation));
-                }
-            }
+        if let Some((id, hamming)) = quick_decode.decode(payload) {
+            return Some((id, hamming, rotation));
         }
         payload = rotate90(payload);
     }
-
-    if best_hamming <= TAG36H11_MAX_HAMMING {
-        Some((best_id, best_hamming as u8, best_rotation))
-    } else {
-        None
-    }
+    None
 }
 
 /// Takes a bounding quad and extracts the AprilTag data, returning a valid detection.
@@ -783,8 +827,12 @@ pub fn extract_detection(
     image: &Image,
     corners: &[[f32; 2]; 4],
     intrinsics: &CameraIntrinsics,
+    quick_decode: &QuickDecode,
 ) -> Option<AprilTagDetection> {
-    let homo = Homography::compute(corners)?;
+    let mut refined_corners = *corners;
+    refine_edges(image, &mut refined_corners);
+
+    let homo = Homography::compute(&refined_corners)?;
 
     let mut black_model = GrayModel::default();
     let mut white_model = GrayModel::default();
@@ -797,15 +845,14 @@ pub fn extract_detection(
         let white_offset = 1.0 / (TAG36H11_WIDTH_AT_BORDER as f32);
 
         let border_samples = [
-            // (Local X, Local Y, is_white)
-            (t, -1.0 + white_offset, false), // Top Black
-            (t, -1.0 - white_offset, true),  // Top White
-            (t, 1.0 - white_offset, false),  // Bottom Black
-            (t, 1.0 + white_offset, true),   // Bottom White
-            (-1.0 + white_offset, t, false), // Left Black
-            (-1.0 - white_offset, t, true),  // Left White
-            (1.0 - white_offset, t, false),  // Right Black
-            (1.0 + white_offset, t, true),   // Right White
+            (t, -1.0 + white_offset, false),
+            (t, -1.0 - white_offset, true),
+            (t, 1.0 - white_offset, false),
+            (t, 1.0 + white_offset, true),
+            (-1.0 + white_offset, t, false),
+            (-1.0 - white_offset, t, true),
+            (1.0 - white_offset, t, false),
+            (1.0 + white_offset, t, true),
         ];
 
         for &(tag_x, tag_y, is_white) in &border_samples {
@@ -827,9 +874,7 @@ pub fn extract_detection(
         return None;
     }
 
-    let mut rcode: u64 = 0;
-    let mut margin_sum = 0.0;
-    let mut margin_count = 0.0;
+    let mut grid = [0.0f32; 64];
 
     for i in 0..TAG36H11_NBITS {
         let bx = TAG36H11_BIT_X[i];
@@ -845,24 +890,48 @@ pub fn extract_detection(
             let black_thresh = black_model.interpolate(tag_x, tag_y);
             let decision_thresh = (white_thresh + black_thresh) / 2.0;
 
-            rcode <<= 1;
-            if val > decision_thresh {
-                rcode |= 1;
-                margin_sum += val - decision_thresh;
-            } else {
-                margin_sum += decision_thresh - val;
-            }
-            margin_count += 1.0;
+            grid[by * 8 + bx] = val - decision_thresh;
         } else {
             return None;
         }
     }
 
-    let (id, hamming, rotation) = match_payload(rcode)?;
+    let mut rcode: u64 = 0;
+    let mut margin_sum = 0.0;
+    let mut margin_count = 0.0;
+
+    let decode_sharpening = 0.25;
+
+    for i in 0..TAG36H11_NBITS {
+        let bx = TAG36H11_BIT_X[i];
+        let by = TAG36H11_BIT_Y[i];
+        let idx = by * 8 + bx;
+
+        let v = grid[idx];
+
+        let laplacian = 4.0 * v
+            - grid[idx - 8] // Top
+            - grid[idx + 8] // Bottom
+            - grid[idx - 1] // Left
+            - grid[idx + 1]; // Right
+
+        let final_val = v + decode_sharpening * laplacian;
+
+        rcode <<= 1;
+        if final_val > 0.0 {
+            rcode |= 1;
+            margin_sum += final_val;
+        } else {
+            margin_sum -= final_val;
+        }
+        margin_count += 1.0;
+    }
+
+    let (id, hamming, rotation) = match_payload(quick_decode, rcode)?;
     let (center_x, center_y) = homo.project(0.0, 0.0);
     let confidence = margin_sum / margin_count;
 
-    let pose = estimate_tag_pose(&homo, corners, intrinsics)?;
+    let pose = estimate_tag_pose(&homo, &refined_corners, intrinsics)?;
 
     Some(AprilTagDetection {
         id,

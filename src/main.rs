@@ -1,5 +1,9 @@
 mod apriltag;
 
+use crate::apriltag::{
+    decode::{QuickDecode, extract_detection},
+    quad::find_quad_corners,
+};
 use axum::{
     Json, Router,
     extract::{
@@ -193,6 +197,8 @@ fn capture_loop(
         tag_size_mm: 165.0,
     };
 
+    let quick_decode = QuickDecode::new();
+
     println!(
         "Starting capture loop at {}x{}...",
         CAPTURE_WIDTH, CAPTURE_HEIGHT
@@ -319,8 +325,8 @@ fn capture_loop(
             let valid_detections: Vec<_> = clusters
                 .par_iter()
                 .filter_map(|cluster| {
-                    let corners = crate::apriltag::quad::find_quad_corners(cluster)?;
-                    crate::apriltag::decode::extract_detection(&mono_image, &corners, &intrinsics)
+                    let corners = find_quad_corners(cluster)?;
+                    extract_detection(&mono_image, &corners, &intrinsics, &quick_decode)
                 })
                 .collect();
             let t_decode = t_start.elapsed();
