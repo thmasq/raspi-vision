@@ -116,14 +116,28 @@ impl UnionFind {
         }
     }
 
-    /// 4-connected union find on the thresholded image pixels
+    /// 4-connected (and partially 8-connected) union find on the thresholded image pixels
     pub fn connected_components(&mut self, im: &[u8], w: usize, h: usize) {
+        const BG_CHUNK: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+
         for y in 0..h {
-            for x in 0..w {
+            let mut x = 0;
+
+            while x < w {
                 let idx = y * w + x;
+
+                if x + 8 <= w {
+                    let chunk = u64::from_ne_bytes(im[idx..idx + 8].try_into().unwrap());
+                    if chunk == BG_CHUNK {
+                        x += 8;
+                        continue;
+                    }
+                }
+
                 let v = im[idx];
 
                 if v == 127 {
+                    x += 1;
                     continue;
                 }
 
@@ -142,6 +156,8 @@ impl UnionFind {
                         self.connect(idx as u32, (idx - w + 1) as u32);
                     }
                 }
+
+                x += 1;
             }
         }
     }

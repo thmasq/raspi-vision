@@ -84,7 +84,7 @@ pub fn process(input: &Image, output: &mut Image) {
 
                     for j in 0..TILE_SIZE {
                         if contrast < MIN_CONTRAST {
-                            out_row[j] = 0;
+                            out_row[j] = 127;
                         } else {
                             out_row[j] = if u16::from(in_row[j]) > thresh {
                                 255
