@@ -38,7 +38,6 @@ const CAPTURE_HEIGHT: usize = 972;
 // --- STREAM SETTINGS ---
 const STREAM_WIDTH: usize = 640;
 const STREAM_HEIGHT: usize = 480;
-const STREAM_EVERY_N_FRAMES: usize = 3;
 
 // --- CAMERA CONTROLS ---
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -62,8 +61,13 @@ struct AppState {
     controls_tx: watch::Sender<CameraControls>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build_global()
+        .unwrap();
+
     let (tx_video, _) = broadcast::channel::<Vec<u8>>(16);
     let (tx_tags, _) = broadcast::channel::<String>(16);
 
@@ -191,89 +195,81 @@ fn capture_loop(
         cam_tx.send(req).unwrap();
     });
 
-    let mut global_uf =
-        crate::apriltag::unionfind::UnionFind::new((CAPTURE_WIDTH * CAPTURE_HEIGHT) as u32);
-    let mut mono_image =
-        crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
-    let mut threshold_img =
-        crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
-    let intrinsics = crate::apriltag::pose::CameraIntrinsics {
-        fx: 500.0,
-        fy: 500.0,
-        cx: 320.0,
-        cy: 240.0,
-        tag_size_mm: 165.0,
-    };
-
-    let quick_decode = QuickDecode::new();
-
     println!("Starting capture loop at {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}...");
 
-    let mut vga_lut_raw: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
-    for y in 0..STREAM_HEIGHT {
-        let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
-        for x in 0..STREAM_WIDTH {
-            let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
-            vga_lut_raw.push(src_y * capture_stride + src_x);
-        }
-    }
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
 
-    let mut vga_lut_dense: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
-    for y in 0..STREAM_HEIGHT {
-        let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
-        for x in 0..STREAM_WIDTH {
-            let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
-            vga_lut_dense.push(src_y * CAPTURE_WIDTH + src_x);
-        }
-    }
+    let tx_video_pipe = tx_video.clone();
+    let tx_tags_pipe = tx_tags.clone();
+    let controls_rx_pipe = controls_rx.clone();
 
-    let mut stream_bytes = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
-    let mut cached_raw_frame = vec![0u8; capture_stride * CAPTURE_HEIGHT];
+    std::thread::spawn(move || {
+        let mut global_uf =
+            crate::apriltag::unionfind::UnionFind::new((CAPTURE_WIDTH * CAPTURE_HEIGHT) as u32);
+        let mut mono_image =
+            crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
+        let mut threshold_img =
+            crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
+        let intrinsics = crate::apriltag::pose::CameraIntrinsics {
+            fx: 500.0,
+            fy: 500.0,
+            cx: 320.0,
+            cy: 240.0,
+            tag_size_mm: 165.0,
+        };
 
-    let mut fps_timer = Instant::now();
-    let mut frames_captured = 0;
-    let mut total_frames = 0;
+        let quick_decode = QuickDecode::new();
 
-    loop {
-        let mut req = cam_rx.recv().unwrap();
-
-        let buffer: &MemoryMappedFrameBuffer<FrameBuffer> =
-            req.buffer(&stream).expect("Failed to get buffer");
-        let planes_data = buffer.data();
-        let raw_data = planes_data.first().expect("Buffer has no plane data");
-
-        frames_captured += 1;
-        total_frames += 1;
-
-        if fps_timer.elapsed() >= Duration::from_secs(1) {
-            println!("Capture FPS: {frames_captured}");
-            frames_captured = 0;
-            fps_timer = Instant::now();
+        let mut vga_lut_raw: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
+        for y in 0..STREAM_HEIGHT {
+            let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
+            for x in 0..STREAM_WIDTH {
+                let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
+                vga_lut_raw.push(src_y * capture_stride + src_x);
+            }
         }
 
-        let current_controls = controls_rx.borrow().clone();
+        let mut vga_lut_dense: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
+        for y in 0..STREAM_HEIGHT {
+            let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
+            for x in 0..STREAM_WIDTH {
+                let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
+                vga_lut_dense.push(src_y * CAPTURE_WIDTH + src_x);
+            }
+        }
 
-        if total_frames % STREAM_EVERY_N_FRAMES == 0 {
+        let mut stream_bytes = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+
+        let mut frames_processed = 0;
+        let mut pipe_fps_timer = Instant::now();
+
+        for raw_frame in frame_rx {
+            frames_processed += 1;
+            if pipe_fps_timer.elapsed() >= Duration::from_secs(1) {
+                println!("Pipeline FPS: {frames_processed}");
+                frames_processed = 0;
+                pipe_fps_timer = Instant::now();
+            }
+
             let pipe_start = Instant::now();
+            let current_controls = controls_rx_pipe.borrow().clone();
 
             let t_start = Instant::now();
-            let copy_len = cached_raw_frame.len().min(raw_data.len());
-            cached_raw_frame[..copy_len].copy_from_slice(&raw_data[..copy_len]);
-
             let mono_slice = mono_image.as_mut_slice();
+
             if capture_stride == CAPTURE_WIDTH {
-                mono_slice.copy_from_slice(&cached_raw_frame[..CAPTURE_WIDTH * CAPTURE_HEIGHT]);
+                mono_slice.copy_from_slice(&raw_frame[..CAPTURE_WIDTH * CAPTURE_HEIGHT]);
             } else {
                 for y in 0..CAPTURE_HEIGHT {
                     let src_offset = y * capture_stride;
                     let dst_offset = y * CAPTURE_WIDTH;
                     mono_slice[dst_offset..dst_offset + CAPTURE_WIDTH]
-                        .copy_from_slice(&cached_raw_frame[src_offset..src_offset + CAPTURE_WIDTH]);
+                        .copy_from_slice(&raw_frame[src_offset..src_offset + CAPTURE_WIDTH]);
                 }
             }
 
             for (dst_pixel, &src_idx) in stream_bytes.iter_mut().zip(&vga_lut_raw) {
-                *dst_pixel = cached_raw_frame[src_idx];
+                *dst_pixel = raw_frame[src_idx];
             }
             let t_downsample = t_start.elapsed();
 
@@ -324,7 +320,7 @@ fn capture_loop(
                 }
             };
 
-            let _ = tx_video.send(debug_frame);
+            let _ = tx_video_pipe.send(debug_frame);
 
             let t_start = Instant::now();
             let mut valid_detections: Vec<_> = clusters
@@ -372,13 +368,44 @@ fn capture_loop(
                     top_detections
                 );
                 if let Ok(json) = serde_json::to_string(&top_detections) {
-                    let _ = tx_tags.send(json);
+                    let _ = tx_tags_pipe.send(json);
                 }
+            }
+        }
+    });
+
+    let mut fps_timer = Instant::now();
+    let mut frames_captured = 0;
+
+    loop {
+        let mut req = cam_rx.recv().unwrap();
+
+        let buffer: &MemoryMappedFrameBuffer<FrameBuffer> =
+            req.buffer(&stream).expect("Failed to get buffer");
+        let planes_data = buffer.data();
+        let raw_data = planes_data.first().expect("Buffer has no plane data");
+
+        frames_captured += 1;
+        if fps_timer.elapsed() >= Duration::from_secs(1) {
+            println!("Capture FPS: {frames_captured}");
+            frames_captured = 0;
+            fps_timer = Instant::now();
+        }
+
+        let frame_copy = raw_data.to_vec();
+
+        match frame_tx.try_send(frame_copy) {
+            Ok(_) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                eprintln!("Pipeline thread panicked or disconnected!");
+                break;
             }
         }
 
         req.reuse(libcamera::request::ReuseFlag::REUSE_BUFFERS);
 
+        let current_controls = controls_rx.borrow().clone();
         let controls = req.controls_mut();
 
         controls
