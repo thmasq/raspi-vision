@@ -1,5 +1,3 @@
-use rustc_hash::FxHashMap;
-
 #[allow(dead_code)]
 pub struct Cluster {
     pub id: u64,
@@ -21,6 +19,8 @@ pub struct UnionFind {
     pub parent: Vec<u32>,
     /// The size of the tree excluding the root.
     pub size: Vec<u32>,
+    /// Persistent arena for boundary points.
+    pub edge_buffer: Vec<(u64, Point)>,
 }
 
 impl UnionFind {
@@ -31,6 +31,7 @@ impl UnionFind {
             maxid,
             parent: vec![u32::MAX; len],
             size: vec![0; len],
+            edge_buffer: Vec::with_capacity(250_000),
         }
     }
 
@@ -60,6 +61,7 @@ impl UnionFind {
     pub fn clear(&mut self) {
         self.parent.fill(u32::MAX);
         self.size.fill(0);
+        self.edge_buffer.clear();
     }
 
     /// Finds the representative (root) of the set containing `id`.
@@ -162,12 +164,10 @@ impl UnionFind {
     }
 
     /// Extract boundary clusters (gradient boundary points)
-    pub fn gradient_clusters(&self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
-        let y_indices: Vec<usize> = (0..(h - 1)).collect();
+    pub fn gradient_clusters(&mut self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
+        self.edge_buffer.clear();
 
-        let mut map = FxHashMap::<u64, Vec<Point>>::default();
-
-        for y in y_indices {
+        for y in 0..(h - 1) {
             let mut connected_last = false;
 
             for x in 1..(w - 1) {
@@ -208,12 +208,15 @@ impl UnionFind {
                             let gx = dx as i16 * (i16::from(v1) - i16::from(v0));
                             let gy = dy as i16 * (i16::from(v1) - i16::from(v0));
 
-                            map.entry(clusterid).or_default().push(Point {
-                                x: (2 * x as isize + dx) as u16,
-                                y: (2 * y as isize + dy) as u16,
-                                gx,
-                                gy,
-                            });
+                            self.edge_buffer.push((
+                                clusterid,
+                                Point {
+                                    x: (2 * x as isize + dx) as u16,
+                                    y: (2 * y as isize + dy) as u16,
+                                    gx,
+                                    gy,
+                                },
+                            ));
 
                             return true;
                         }
@@ -235,8 +238,37 @@ impl UnionFind {
             }
         }
 
-        map.into_iter()
-            .map(|(id, points)| Cluster { id, points })
-            .collect()
+        self.edge_buffer.sort_unstable_by_key(|&(id, _)| id);
+
+        let mut clusters = Vec::new();
+        let mut chunk_start = 0;
+
+        while chunk_start < self.edge_buffer.len() {
+            let current_id = self.edge_buffer[chunk_start].0;
+            let mut chunk_end = chunk_start + 1;
+
+            while chunk_end < self.edge_buffer.len() && self.edge_buffer[chunk_end].0 == current_id
+            {
+                chunk_end += 1;
+            }
+
+            let chunk_size = chunk_end - chunk_start;
+
+            if chunk_size >= 24 {
+                let points: Vec<Point> = self.edge_buffer[chunk_start..chunk_end]
+                    .iter()
+                    .map(|&(_, p)| p)
+                    .collect();
+
+                clusters.push(Cluster {
+                    id: current_id,
+                    points,
+                });
+            }
+
+            chunk_start = chunk_end;
+        }
+
+        clusters
     }
 }
