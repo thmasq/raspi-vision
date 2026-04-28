@@ -340,6 +340,11 @@ fn capture_loop(
 
             let top_detections: Vec<_> = valid_detections.into_iter().take(10).collect();
             if !top_detections.is_empty() {
+                println!(
+                    "Found {} tag(s): {:?}",
+                    top_detections.len(),
+                    top_detections
+                );
                 if let Ok(json) = serde_json::to_string(&top_detections) {
                     let _ = tx_tags.send(json);
                 }
