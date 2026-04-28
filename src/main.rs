@@ -307,8 +307,8 @@ fn capture_loop(
 
                     for cluster in &clusters {
                         for pt in &cluster.points {
-                            let px = (pt.x as f32 / scale_x) as usize;
-                            let py = (pt.y as f32 / scale_y) as usize;
+                            let px = ((pt.x as f32 / 2.0) / scale_x) as usize;
+                            let py = ((pt.y as f32 / 2.0) / scale_y) as usize;
                             let idx = py * STREAM_WIDTH + px;
                             if idx < buf.len() {
                                 buf[idx] = 255;

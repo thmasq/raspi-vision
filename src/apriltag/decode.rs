@@ -897,8 +897,11 @@ pub fn extract_detection(
     }
 
     let mut rcode: u64 = 0;
-    let mut margin_sum = 0.0;
-    let mut margin_count = 0.0;
+
+    let mut white_score = 0.0;
+    let mut black_score = 0.0;
+    let mut white_count = 1.0;
+    let mut black_count = 1.0;
 
     let decode_sharpening = 0.25;
 
@@ -920,18 +923,32 @@ pub fn extract_detection(
         rcode <<= 1;
         if final_val > 0.0 {
             rcode |= 1;
-            margin_sum += final_val;
+            white_score += final_val;
+            white_count += 1.0;
         } else {
-            margin_sum -= final_val;
+            black_score -= final_val;
+            black_count += 1.0;
         }
-        margin_count += 1.0;
     }
 
     let (id, hamming, rotation) = match_payload(quick_decode, rcode)?;
-    let (center_x, center_y) = homo.project(0.0, 0.0);
-    let confidence = margin_sum / margin_count;
 
-    let pose = estimate_tag_pose(&homo, &refined_corners, intrinsics)?;
+    let theta = rotation as f32 * std::f32::consts::PI / 2.0;
+    let c = theta.cos();
+    let s = theta.sin();
+    let r_mat = nalgebra::SMatrix::<f32, 3, 3>::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
+
+    let corrected_homo = Homography { h: homo.h * r_mat };
+    let (center_x, center_y) = corrected_homo.project(0.0, 0.0);
+
+    let mut corrected_corners = [[0.0; 2]; 4];
+    for i in 0..4 {
+        corrected_corners[i] = refined_corners[(i + rotation as usize) % 4];
+    }
+
+    let confidence = (white_score / white_count).min(black_score / black_count);
+
+    let pose = estimate_tag_pose(&corrected_homo, &corrected_corners, intrinsics)?;
 
     Some(AprilTagDetection {
         id,
