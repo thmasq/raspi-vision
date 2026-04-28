@@ -30,16 +30,19 @@ impl Image {
     }
 
     #[inline(always)]
+    #[allow(clippy::inline_always)]
     pub fn as_slice(&self) -> &[u8] {
         &self.data
     }
 
     #[inline(always)]
+    #[allow(clippy::inline_always)]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.data
     }
 
     #[inline(always)]
+    #[allow(clippy::inline_always)]
     pub fn row(&self, y: usize) -> &[u8] {
         let start = y * self.stride;
         &self.data[start..start + self.width]

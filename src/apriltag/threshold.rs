@@ -73,7 +73,7 @@ pub fn process(input: &Image, output: &mut Image) {
                 }
 
                 let contrast = local_max.saturating_sub(local_min);
-                let thresh = local_min as u16 + (contrast as u16 >> 1);
+                let thresh = u16::from(local_min) + (u16::from(contrast) >> 1);
                 let x_start = tx * TILE_SIZE;
 
                 for i in 0..TILE_SIZE {
@@ -86,7 +86,11 @@ pub fn process(input: &Image, output: &mut Image) {
                         if contrast < MIN_CONTRAST {
                             out_row[j] = 0;
                         } else {
-                            out_row[j] = if (in_row[j] as u16) > thresh { 255 } else { 0 };
+                            out_row[j] = if u16::from(in_row[j]) > thresh {
+                                255
+                            } else {
+                                0
+                            };
                         }
                     }
                 }

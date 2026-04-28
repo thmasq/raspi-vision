@@ -18,14 +18,14 @@ pub struct Point {
 /// A pixel-based Union-Find implementation.
 pub struct UnionFind {
     pub maxid: u32,
-    /// Parent node for each element. Initialized to u32::MAX.
+    /// Parent node for each element. Initialized to `u32::MAX`.
     pub parent: Vec<u32>,
     /// The size of the tree excluding the root.
     pub size: Vec<u32>,
 }
 
 impl UnionFind {
-    /// Creates a new UnionFind structure capable of holding up to `maxid` elements.
+    /// Creates a new `UnionFind` structure capable of holding up to `maxid` elements.
     pub fn new(maxid: u32) -> Self {
         let len = (maxid + 1) as usize;
         Self {
@@ -57,7 +57,7 @@ impl UnionFind {
         id
     }
 
-    /// Resets the UnionFind structure so it can be reused without reallocating.
+    /// Resets the `UnionFind` structure so it can be reused without reallocating.
     pub fn clear(&mut self) {
         self.parent.fill(u32::MAX);
         self.size.fill(0);
@@ -152,81 +152,75 @@ impl UnionFind {
 
         let map = y_indices
             .into_par_iter()
-            .fold(
-                || FxHashMap::<u64, Vec<Point>>::default(),
-                |mut local_map, y| {
-                    let mut connected_last = false;
+            .fold(FxHashMap::<u64, Vec<Point>>::default, |mut local_map, y| {
+                let mut connected_last = false;
 
-                    for x in 1..(w - 1) {
-                        let idx0 = y * w + x;
-                        let v0 = im[idx0];
+                for x in 1..(w - 1) {
+                    let idx0 = y * w + x;
+                    let v0 = im[idx0];
 
-                        if v0 == 127 {
-                            connected_last = false;
-                            continue;
-                        }
+                    if v0 == 127 {
+                        connected_last = false;
+                        continue;
+                    }
 
-                        let rep0 = self.get_representative_readonly(idx0 as u32);
-                        let size0 = self.size[rep0 as usize] + 1;
-                        if size0 < 25 {
-                            connected_last = false;
-                            continue;
-                        }
+                    let rep0 = self.get_representative_readonly(idx0 as u32);
+                    let size0 = self.size[rep0 as usize] + 1;
+                    if size0 < 25 {
+                        connected_last = false;
+                        continue;
+                    }
 
-                        let mut check_conn = |dx: isize, dy: isize| -> bool {
-                            let nx = (x as isize + dx) as usize;
-                            let ny = (y as isize + dy) as usize;
-                            let idx1 = ny * w + nx;
-                            let v1 = im[idx1];
+                    let mut check_conn = |dx: isize, dy: isize| -> bool {
+                        let nx = (x as isize + dx) as usize;
+                        let ny = (y as isize + dy) as usize;
+                        let idx1 = ny * w + nx;
+                        let v1 = im[idx1];
 
-                            if v1 != 127 && (v0 as u16 + v1 as u16) == 255 {
-                                let rep1 = self.get_representative_readonly(idx1 as u32);
-                                let size1 = self.size[rep1 as usize] + 1;
+                        if v1 != 127 && (u16::from(v0) + u16::from(v1)) == 255 {
+                            let rep1 = self.get_representative_readonly(idx1 as u32);
+                            let size1 = self.size[rep1 as usize] + 1;
 
-                                if size1 >= 25 {
-                                    let clusterid = if rep0 < rep1 {
-                                        (rep1 as u64) << 32 | (rep0 as u64)
-                                    } else {
-                                        (rep0 as u64) << 32 | (rep1 as u64)
-                                    };
+                            if size1 >= 25 {
+                                let clusterid = if rep0 < rep1 {
+                                    u64::from(rep1) << 32 | u64::from(rep0)
+                                } else {
+                                    u64::from(rep0) << 32 | u64::from(rep1)
+                                };
 
-                                    let gx = dx as i16 * (v1 as i16 - v0 as i16);
-                                    let gy = dy as i16 * (v1 as i16 - v0 as i16);
+                                let gx = dx as i16 * (i16::from(v1) - i16::from(v0));
+                                let gy = dy as i16 * (i16::from(v1) - i16::from(v0));
 
-                                    local_map.entry(clusterid).or_default().push(Point {
-                                        x: (2 * x as isize + dx) as u16,
-                                        y: (2 * y as isize + dy) as u16,
-                                        gx,
-                                        gy,
-                                    });
+                                local_map.entry(clusterid).or_default().push(Point {
+                                    x: (2 * x as isize + dx) as u16,
+                                    y: (2 * y as isize + dy) as u16,
+                                    gx,
+                                    gy,
+                                });
 
-                                    return true;
-                                }
+                                return true;
                             }
-                            false
-                        };
-
-                        let mut connected = false;
-                        connected |= check_conn(1, 0);
-                        connected |= check_conn(0, 1);
-                        if !connected_last {
-                            connected |= check_conn(-1, 1);
                         }
-                        connected |= check_conn(1, 1);
-                        connected_last = connected;
+                        false
+                    };
+
+                    let mut connected = false;
+                    connected |= check_conn(1, 0);
+                    connected |= check_conn(0, 1);
+                    if !connected_last {
+                        connected |= check_conn(-1, 1);
                     }
-                    local_map
-                },
-            )
-            .reduce(
-                || FxHashMap::default(),
-                |mut map1, map2| {
-                    for (k, mut v) in map2 {
-                        map1.entry(k).or_default().append(&mut v);
-                    }
-                    map1
-                },
-            );
+                    connected |= check_conn(1, 1);
+                    connected_last = connected;
+                }
+                local_map
+            })
+            .reduce(FxHashMap::default, |mut map1, map2| {
+                for (k, mut v) in map2 {
+                    map1.entry(k).or_default().append(&mut v);
+                }
+                map1
+            });
 
         map.into_iter()
             .map(|(id, points)| Cluster { id, points })

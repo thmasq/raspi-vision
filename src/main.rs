@@ -1,3 +1,11 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::similar_names
+)]
+
 mod apriltag;
 
 use crate::apriltag::{
@@ -33,7 +41,7 @@ const STREAM_HEIGHT: usize = 480;
 const STREAM_EVERY_N_FRAMES: usize = 3;
 
 // --- CAMERA CONTROLS ---
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum DebugView {
     Raw,
     Threshold,
@@ -74,7 +82,7 @@ async fn main() {
 
     let capture_controls_rx = controls_rx.clone();
     tokio::task::spawn_blocking(move || {
-        capture_loop(tx_video, tx_tags, capture_controls_rx);
+        capture_loop(&tx_video, &tx_tags, &capture_controls_rx);
     });
 
     let app = Router::new()
@@ -84,7 +92,7 @@ async fn main() {
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9080));
-    println!("Server running at http://{}", addr);
+    println!("Server running at http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -130,9 +138,9 @@ async fn update_controls(
 }
 
 fn capture_loop(
-    tx_video: broadcast::Sender<Vec<u8>>,
-    tx_tags: broadcast::Sender<String>,
-    controls_rx: watch::Receiver<CameraControls>,
+    tx_video: &broadcast::Sender<Vec<u8>>,
+    tx_tags: &broadcast::Sender<String>,
+    controls_rx: &watch::Receiver<CameraControls>,
 ) {
     let mgr = CameraManager::new().expect("Failed to initialize libcamera");
     let cameras = mgr.cameras();
@@ -199,10 +207,7 @@ fn capture_loop(
 
     let quick_decode = QuickDecode::new();
 
-    println!(
-        "Starting capture loop at {}x{}...",
-        CAPTURE_WIDTH, CAPTURE_HEIGHT
-    );
+    println!("Starting capture loop at {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}...");
 
     let mut vga_lut_raw: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
     for y in 0..STREAM_HEIGHT {
@@ -235,13 +240,13 @@ fn capture_loop(
         let buffer: &MemoryMappedFrameBuffer<FrameBuffer> =
             req.buffer(&stream).expect("Failed to get buffer");
         let planes_data = buffer.data();
-        let raw_data = planes_data.get(0).expect("Buffer has no plane data");
+        let raw_data = planes_data.first().expect("Buffer has no plane data");
 
         frames_captured += 1;
         total_frames += 1;
 
         if fps_timer.elapsed() >= Duration::from_secs(1) {
-            println!("Capture FPS: {}", frames_captured);
+            println!("Capture FPS: {frames_captured}");
             frames_captured = 0;
             fps_timer = Instant::now();
         }
@@ -307,8 +312,8 @@ fn capture_loop(
 
                     for cluster in &clusters {
                         for pt in &cluster.points {
-                            let px = ((pt.x as f32 / 2.0) / scale_x) as usize;
-                            let py = ((pt.y as f32 / 2.0) / scale_y) as usize;
+                            let px = ((f32::from(pt.x) / 2.0) / scale_x) as usize;
+                            let py = ((f32::from(pt.y) / 2.0) / scale_y) as usize;
                             let idx = py * STREAM_WIDTH + px;
                             if idx < buf.len() {
                                 buf[idx] = 255;
@@ -343,7 +348,7 @@ fn capture_loop(
                 let is_duplicate = filtered_detections.iter().any(|kept: &AprilTagDetection| {
                     let dx = kept.center_x - det.center_x;
                     let dy = kept.center_y - det.center_y;
-                    let dist_sq = dx * dx + dy * dy;
+                    let dist_sq = dy.mul_add(dy, dx * dx);
 
                     dist_sq < 100.0
                 });
@@ -356,8 +361,7 @@ fn capture_loop(
             let total_pipe = pipe_start.elapsed();
 
             println!(
-                "Pipe: {:?} | Prep: {:?}, Thresh: {:?}, UF: {:?}, Cluster: {:?}, Decode: {:?}",
-                total_pipe, t_downsample, t_thresh, t_uf, t_cluster, t_decode
+                "Pipe: {total_pipe:?} | Prep: {t_downsample:?}, Thresh: {t_thresh:?}, UF: {t_uf:?}, Cluster: {t_cluster:?}, Decode: {t_decode:?}"
             );
 
             let top_detections: Vec<_> = filtered_detections.into_iter().take(10).collect();

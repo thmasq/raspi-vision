@@ -1,4 +1,13 @@
+#![allow(clippy::inline_always)]
+
 use crate::apriltag::{image::Image, unionfind::Cluster};
+
+const RANGE: f32 = 2.0;
+const STEPS_PER_UNIT: usize = 4;
+const STEP_LENGTH: f32 = 1.0 / STEPS_PER_UNIT as f32;
+const MAX_STEPS: usize = 2 * STEPS_PER_UNIT * RANGE as usize + 1;
+const DELTA: f32 = 0.5;
+const GRANGE: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy)]
 struct FitPoint {
@@ -24,6 +33,17 @@ struct LineFitPt {
 /// Fits a quadrilateral to a point cloud cluster representing a tag boundary.
 /// Replicates `fit_quad` and `quad_segment_maxima` from the official C pipeline.
 pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
+    let pts = prepare_points(cluster)?;
+    let lfps = compute_lfps(&pts);
+
+    let errs = compute_corner_response(&pts, &lfps)?;
+    let maxima = detect_corner_candidates(&errs);
+
+    let quad = select_best_quad(&lfps, pts.len(), &maxima)?;
+    intersect_quad_lines(&lfps, pts.len(), quad)
+}
+
+fn prepare_points(cluster: &Cluster) -> Option<Vec<FitPoint>> {
     let min_cluster_pixels = 24;
     if cluster.points.len() < min_cluster_pixels {
         return None;
@@ -33,10 +53,10 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
         .points
         .iter()
         .map(|p| FitPoint {
-            x: p.x as f64,
-            y: p.y as f64,
-            gx: p.gx as f64,
-            gy: p.gy as f64,
+            x: f64::from(p.x),
+            y: f64::from(p.y),
+            gx: f64::from(p.gx),
+            gy: f64::from(p.gy),
             slope: 0.0,
         })
         .collect();
@@ -61,10 +81,10 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
         }
     }
 
-    let cx = (xmin + xmax) * 0.5 + 0.05118;
-    let cy = (ymin + ymax) * 0.5 - 0.028581;
+    let cx = (xmin + xmax).mul_add(0.5, 0.05118);
+    let cy = (ymin + ymax).mul_add(0.5, -0.028_581);
 
-    for p in pts.iter_mut() {
+    for p in &mut pts {
         let dx = p.x - cx;
         let dy = p.y - cy;
         p.slope = dy.atan2(dx);
@@ -72,8 +92,10 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
 
     pts.sort_unstable_by(|a, b| a.slope.partial_cmp(&b.slope).unwrap());
 
-    let lfps = compute_lfps(&pts);
+    Some(pts)
+}
 
+fn compute_corner_response(pts: &[FitPoint], lfps: &[LineFitPt]) -> Option<Vec<f64>> {
     let sz = pts.len();
     let ksz = 20.min(sz / 12);
     if ksz < 2 {
@@ -81,9 +103,9 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
     }
 
     let mut errs = vec![0.0; sz];
-    for i in 0..sz {
-        let (_, _, _, _, err, _) = fit_line(&lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz);
-        errs[i] = err;
+    for (i, err_slot) in errs.iter_mut().enumerate().take(sz) {
+        let (_, _, _, _, err, _) = fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz);
+        *err_slot = err;
     }
 
     let sigma = 1.0_f64;
@@ -93,32 +115,36 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
 
     let mut f = Vec::with_capacity(fsz as usize);
     for i in 0..fsz {
-        let j = (i - fsz / 2) as f64;
+        let j = f64::from(i - fsz / 2);
         f.push((-j * j / (2.0 * sigma * sigma)).exp());
     }
 
     let mut y_errs = vec![0.0; sz];
-    for iy in 0..sz {
+
+    for (iy, y_err) in y_errs.iter_mut().enumerate().take(sz) {
         let mut acc = 0.0;
+
         for i in 0..fsz {
             let idx = (iy as i32 + i - fsz / 2 + sz as i32) % (sz as i32);
-            acc += errs[idx as usize] * f[i as usize];
+            acc = errs[idx as usize].mul_add(f[i as usize], acc);
         }
-        y_errs[iy] = acc;
-    }
-    errs = y_errs;
 
+        *y_err = acc;
+    }
+
+    Some(y_errs)
+}
+
+fn detect_corner_candidates(errs: &[f64]) -> Vec<usize> {
+    let sz = errs.len();
     let mut maxima = Vec::new();
     let mut maxima_errs = Vec::new();
+
     for i in 0..sz {
         if errs[i] > errs[(i + 1) % sz] && errs[i] > errs[(i + sz - 1) % sz] {
             maxima.push(i);
             maxima_errs.push(errs[i]);
         }
-    }
-
-    if maxima.len() < 4 {
-        return None;
     }
 
     let max_nmaxima = 10;
@@ -129,47 +155,54 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
 
         maxima = maxima
             .into_iter()
-            .zip(maxima_errs.into_iter())
+            .zip(maxima_errs)
             .filter(|(_, err)| *err > threshold)
             .map(|(idx, _)| idx)
             .collect();
     }
 
+    maxima
+}
+
+fn select_best_quad(lfps: &[LineFitPt], sz: usize, maxima: &[usize]) -> Option<[usize; 4]> {
+    if maxima.len() < 4 {
+        return None;
+    }
+
     let nmaxima = maxima.len();
     let mut best_indices = [0; 4];
     let mut best_error = f64::INFINITY;
-    let max_dot = (25.0_f64 * std::f64::consts::PI / 180.0).cos();
+    let max_dot = 25.0_f64.to_radians().cos();
     let max_line_fit_mse = 10.0_f64;
 
     for m0 in 0..(nmaxima.saturating_sub(3)) {
         let i0 = maxima[m0];
         for m1 in (m0 + 1)..(nmaxima.saturating_sub(2)) {
             let i1 = maxima[m1];
-            let (_, _, nx01, ny01, err01, mse01) = fit_line(&lfps, sz, i0, i1);
+            let (_, _, nx01, ny01, err01, mse01) = fit_line(lfps, sz, i0, i1);
             if mse01 > max_line_fit_mse {
                 continue;
             }
 
             for m2 in (m1 + 1)..(nmaxima.saturating_sub(1)) {
                 let i2 = maxima[m2];
-                let (_, _, nx12, ny12, err12, mse12) = fit_line(&lfps, sz, i1, i2);
+                let (_, _, nx12, ny12, err12, mse12) = fit_line(lfps, sz, i1, i2);
                 if mse12 > max_line_fit_mse {
                     continue;
                 }
 
-                let dot = nx01 * nx12 + ny01 * ny12;
+                let dot = ny01.mul_add(ny12, nx01 * nx12);
                 if dot.abs() > max_dot {
                     continue;
                 }
 
-                for m3 in (m2 + 1)..nmaxima {
-                    let i3 = maxima[m3];
-                    let (_, _, _, _, err23, mse23) = fit_line(&lfps, sz, i2, i3);
+                for &i3 in maxima.iter().take(nmaxima).skip(m2 + 1) {
+                    let (_, _, _, _, err23, mse23) = fit_line(lfps, sz, i2, i3);
                     if mse23 > max_line_fit_mse {
                         continue;
                     }
 
-                    let (_, _, _, _, err30, mse30) = fit_line(&lfps, sz, i3, i0);
+                    let (_, _, _, _, err30, mse30) = fit_line(lfps, sz, i3, i0);
                     if mse30 > max_line_fit_mse {
                         continue;
                     }
@@ -188,11 +221,19 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
         return None;
     }
 
+    Some(best_indices)
+}
+
+fn intersect_quad_lines(
+    lfps: &[LineFitPt],
+    sz: usize,
+    best_indices: [usize; 4],
+) -> Option<[[f32; 2]; 4]> {
     let mut lines = [(0.0, 0.0, 0.0, 0.0); 4];
     for i in 0..4 {
         let i0 = best_indices[i];
         let i1 = best_indices[(i + 1) & 3];
-        let (ex, ey, nx, ny, _, _) = fit_line(&lfps, sz, i0, i1);
+        let (ex, ey, nx, ny, _, _) = fit_line(lfps, sz, i0, i1);
         lines[i] = (ex, ey, nx, ny);
     }
 
@@ -209,16 +250,16 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
         let b0 = -p0_x + p1_x;
         let b1 = -p0_y + p1_y;
 
-        let det = a00 * a11 - a10 * a01;
+        let det = a10.mul_add(-a01, a00 * a11);
         if det.abs() < 0.001 {
             return None;
         }
 
         let w00 = a11 / det;
         let w01 = -a01 / det;
-        let l0 = w00 * b0 + w01 * b1;
+        let l0 = w01.mul_add(b1, w00 * b0);
 
-        exact_corners[i] = [(p0_x + l0 * a00) as f32, (p0_y + l0 * a10) as f32];
+        exact_corners[i] = [l0.mul_add(a00, p0_x) as f32, l0.mul_add(a10, p0_y) as f32];
     }
 
     Some(exact_corners)
@@ -239,9 +280,9 @@ fn compute_lfps(pts: &[FitPoint]) -> Vec<LineFitPt> {
 
     for i in 0..len {
         let p = &pts[i];
-        let x = p.x * 0.5 + 0.5;
-        let y = p.y * 0.5 + 0.5;
-        let w = (p.gx * p.gx + p.gy * p.gy).sqrt() + 1.0;
+        let x = p.x.mul_add(0.5, 0.5);
+        let y = p.y.mul_add(0.5, 0.5);
+        let w = p.gx.hypot(p.gy) + 1.0;
 
         weights[i] = w;
         w_x[i] = w * x;
@@ -319,20 +360,20 @@ fn fit_line(lfps: &[LineFitPt], sz: usize, i0: usize, i1: usize) -> (f64, f64, f
 
     let ex = mx / w;
     let ey = my / w;
-    let cxx = mxx / w - ex * ex;
-    let cxy = mxy / w - ex * ey;
-    let cyy = myy / w - ey * ey;
+    let cxx = ex.mul_add(-ex, mxx / w);
+    let cxy = ex.mul_add(-ey, mxy / w);
+    let cyy = ey.mul_add(-ey, myy / w);
 
-    let eig_small = 0.5 * (cxx + cyy - ((cxx - cyy) * (cxx - cyy) + 4.0 * cxy * cxy).sqrt());
-    let eig_large = 0.5 * (cxx + cyy + ((cxx - cyy) * (cxx - cyy) + 4.0 * cxy * cxy).sqrt());
+    let eig_small = 0.5 * (cxx + cyy - (4.0 * cxy).mul_add(cxy, (cxx - cyy) * (cxx - cyy)).sqrt());
+    let eig_large = 0.5 * (cxx + cyy + (4.0 * cxy).mul_add(cxy, (cxx - cyy) * (cxx - cyy)).sqrt());
 
     let nx1 = cxx - eig_large;
     let ny1 = cxy;
-    let m1 = nx1 * nx1 + ny1 * ny1;
+    let m1 = ny1.mul_add(ny1, nx1 * nx1);
 
     let nx2 = cxy;
     let ny2 = cyy - eig_large;
-    let m2 = nx2 * nx2 + ny2 * ny2;
+    let m2 = nx2.mul_add(nx2, ny2 * ny2);
 
     let (mut nx, mut ny, m) = if m1 > m2 {
         (nx1, ny1, m1)
@@ -373,12 +414,18 @@ fn sample_pixel_bilinear(image: &Image, x: f32, y: f32) -> Option<f32> {
     let r0 = image.row(y0 as usize);
     let r1 = image.row(y1 as usize);
 
-    let v00 = r0[x0 as usize] as f32;
-    let v10 = r0[x1 as usize] as f32;
-    let v01 = r1[x0 as usize] as f32;
-    let v11 = r1[x1 as usize] as f32;
+    let v00 = f32::from(r0[x0 as usize]);
+    let v10 = f32::from(r0[x1 as usize]);
+    let v01 = f32::from(r1[x0 as usize]);
+    let v11 = f32::from(r1[x1 as usize]);
 
-    Some((1.0 - a) * (1.0 - b) * v00 + a * (1.0 - b) * v10 + (1.0 - a) * b * v01 + a * b * v11)
+    Some((a * b).mul_add(
+        v11,
+        ((1.0 - a) * b).mul_add(
+            v01,
+            (a * (1.0 - b)).mul_add(v10, (1.0 - a) * (1.0 - b) * v00),
+        ),
+    ))
 }
 
 /// Refines the edges of a quadrilateral by sampling local image gradients.
@@ -386,14 +433,14 @@ fn sample_pixel_bilinear(image: &Image, x: f32, y: f32) -> Option<f32> {
 pub fn refine_edges(image: &Image, corners: &mut [[f32; 2]; 4]) {
     let mut lines = [[0.0f32; 4]; 4];
 
-    for edge in 0..4 {
+    for (edge, line) in lines.iter_mut().enumerate() {
         let a = edge;
         let b = (edge + 1) & 3;
 
         let mut nx = corners[b][1] - corners[a][1];
         let mut ny = -corners[b][0] + corners[a][0];
 
-        let mag = (nx * nx + ny * ny).sqrt();
+        let mag = nx.hypot(ny);
         if mag < 1e-5 {
             continue;
         }
@@ -411,27 +458,20 @@ pub fn refine_edges(image: &Image, corners: &mut [[f32; 2]; 4]) {
 
         for s in 0..nsamples {
             let alpha = (1 + s) as f32 / (nsamples + 1) as f32;
-            let x0 = alpha * corners[a][0] + (1.0 - alpha) * corners[b][0];
-            let y0 = alpha * corners[a][1] + (1.0 - alpha) * corners[b][1];
+            let x0 = (1.0 - alpha).mul_add(corners[b][0], alpha * corners[a][0]);
+            let y0 = (1.0 - alpha).mul_add(corners[b][1], alpha * corners[a][1]);
 
             let mut mn = 0.0;
             let mut m_count = 0.0;
 
-            const RANGE: f32 = 2.0;
-            const STEPS_PER_UNIT: usize = 4;
-            const STEP_LENGTH: f32 = 1.0 / STEPS_PER_UNIT as f32;
-            const MAX_STEPS: usize = 2 * STEPS_PER_UNIT * RANGE as usize + 1;
-            const DELTA: f32 = 0.5;
-            const GRANGE: f32 = 1.0;
-
             for step in 0..MAX_STEPS {
-                let dist = -RANGE + STEP_LENGTH * step as f32;
+                let dist = STEP_LENGTH.mul_add(step as f32, -RANGE);
 
-                let x1 = x0 + (dist + GRANGE) * nx - DELTA;
-                let y1 = y0 + (dist + GRANGE) * ny - DELTA;
+                let x1 = (dist + GRANGE).mul_add(nx, x0) - DELTA;
+                let y1 = (dist + GRANGE).mul_add(ny, y0) - DELTA;
 
-                let x2 = x0 + (dist - GRANGE) * nx - DELTA;
-                let y2 = y0 + (dist - GRANGE) * ny - DELTA;
+                let x2 = (dist - GRANGE).mul_add(nx, x0) - DELTA;
+                let y2 = (dist - GRANGE).mul_add(ny, y0) - DELTA;
 
                 if let (Some(g1), Some(g2)) = (
                     sample_pixel_bilinear(image, x1, y1),
@@ -463,9 +503,9 @@ pub fn refine_edges(image: &Image, corners: &mut [[f32; 2]; 4]) {
         }
 
         if n < 2.0 {
-            lines[edge] = [
-                (corners[a][0] + corners[b][0]) / 2.0,
-                (corners[a][1] + corners[b][1]) / 2.0,
+            *line = [
+                f32::midpoint(corners[a][0], corners[b][0]),
+                f32::midpoint(corners[a][1], corners[b][1]),
                 nx,
                 ny,
             ];
@@ -479,7 +519,8 @@ pub fn refine_edges(image: &Image, corners: &mut [[f32; 2]; 4]) {
         let cyy = myy / n - ey * ey;
 
         let normal_theta = 0.5 * (-2.0 * cxy).atan2(cyy - cxx);
-        lines[edge] = [ex, ey, normal_theta.cos(), normal_theta.sin()];
+
+        *line = [ex, ey, normal_theta.cos(), normal_theta.sin()];
     }
 
     for i in 0..4 {
@@ -490,15 +531,15 @@ pub fn refine_edges(image: &Image, corners: &mut [[f32; 2]; 4]) {
         let b0 = -lines[i][0] + lines[(i + 1) & 3][0];
         let b1 = -lines[i][1] + lines[(i + 1) & 3][1];
 
-        let det = a00 * a11 - a10 * a01;
+        let det = a10.mul_add(-a01, a00 * a11);
 
         if det.abs() > 0.001 {
             let w00 = a11 / det;
             let w01 = -a01 / det;
-            let l0 = w00 * b0 + w01 * b1;
+            let l0 = w01.mul_add(b1, w00 * b0);
 
-            corners[(i + 1) & 3][0] = lines[i][0] + l0 * a00;
-            corners[(i + 1) & 3][1] = lines[i][1] + l0 * a10;
+            corners[(i + 1) & 3][0] = l0.mul_add(a00, lines[i][0]);
+            corners[(i + 1) & 3][1] = l0.mul_add(a10, lines[i][1]);
         }
     }
 }
