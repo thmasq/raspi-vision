@@ -5,6 +5,7 @@ use nalgebra::{SMatrix, SVector};
 use serde::Serialize;
 
 pub const TAG36H11_WIDTH_AT_BORDER: usize = 8;
+#[allow(dead_code)]
 pub const TAG36H11_TOTAL_WIDTH: usize = 10;
 pub const TAG36H11_NBITS: usize = 36;
 pub const TAG36H11_MAX_HAMMING: u32 = 2;

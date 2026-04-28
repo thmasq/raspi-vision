@@ -44,11 +44,4 @@ impl Image {
         let start = y * self.stride;
         &self.data[start..start + self.width]
     }
-
-    #[inline(always)]
-    pub fn row_mut(&mut self, y: usize) -> &mut [u8] {
-        let start = y * self.stride;
-        let width = self.width;
-        &mut self.data[start..start + width]
-    }
 }

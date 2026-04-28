@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+#[allow(dead_code)]
 pub struct Cluster {
     pub id: u64,
     pub points: Vec<Point>,
@@ -85,6 +86,7 @@ impl UnionFind {
     }
 
     /// Returns the number of elements in the set containing `id`.
+    #[allow(dead_code)]
     pub fn get_set_size(&mut self, id: u32) -> u32 {
         let repid = self.get_representative(id);
         self.size[repid as usize] + 1
