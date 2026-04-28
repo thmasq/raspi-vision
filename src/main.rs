@@ -1,7 +1,7 @@
 mod apriltag;
 
 use crate::apriltag::{
-    decode::{QuickDecode, extract_detection},
+    decode::{AprilTagDetection, QuickDecode, extract_detection},
     quad::find_quad_corners,
 };
 use axum::{
@@ -322,7 +322,7 @@ fn capture_loop(
             let _ = tx_video.send(debug_frame);
 
             let t_start = Instant::now();
-            let valid_detections: Vec<_> = clusters
+            let mut valid_detections: Vec<_> = clusters
                 .par_iter()
                 .filter_map(|cluster| {
                     let corners = find_quad_corners(cluster)?;
@@ -331,6 +331,28 @@ fn capture_loop(
                 .collect();
             let t_decode = t_start.elapsed();
 
+            valid_detections.sort_unstable_by(|a, b| {
+                let conf_a = a.confidence;
+                let conf_b = b.confidence;
+                conf_b.partial_cmp(&conf_a).unwrap()
+            });
+
+            let mut filtered_detections = Vec::new();
+
+            for det in valid_detections {
+                let is_duplicate = filtered_detections.iter().any(|kept: &AprilTagDetection| {
+                    let dx = kept.center_x - det.center_x;
+                    let dy = kept.center_y - det.center_y;
+                    let dist_sq = dx * dx + dy * dy;
+
+                    dist_sq < 100.0
+                });
+
+                if !is_duplicate {
+                    filtered_detections.push(det);
+                }
+            }
+
             let total_pipe = pipe_start.elapsed();
 
             println!(
@@ -338,7 +360,7 @@ fn capture_loop(
                 total_pipe, t_downsample, t_thresh, t_uf, t_cluster, t_decode
             );
 
-            let top_detections: Vec<_> = valid_detections.into_iter().take(10).collect();
+            let top_detections: Vec<_> = filtered_detections.into_iter().take(10).collect();
             if !top_detections.is_empty() {
                 println!(
                     "Found {} tag(s): {:?}",
