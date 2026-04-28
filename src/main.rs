@@ -24,7 +24,6 @@ use axum::{
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::{camera_manager::CameraManager, controls, formats};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,11 +62,6 @@ struct AppState {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build_global()
-        .unwrap();
-
     let (tx_video, _) = broadcast::channel::<Vec<u8>>(16);
     let (tx_tags, _) = broadcast::channel::<String>(16);
 
@@ -324,7 +318,7 @@ fn capture_loop(
 
             let t_start = Instant::now();
             let mut valid_detections: Vec<_> = clusters
-                .par_iter()
+                .iter()
                 .filter_map(|cluster| {
                     let corners = find_quad_corners(cluster)?;
                     extract_detection(&mono_image, &corners, &intrinsics, &quick_decode)
