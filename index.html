@@ -157,9 +157,12 @@
         function drawOverlay() {
             if (!latestTags || latestTags.length === 0) return;
 
+            const scaleX = 1296 / 640;
+            const scaleY = 972 / 480;
+
             for (const tag of latestTags) {
-                const cx = tag.center_x;
-                const cy = tag.center_y;
+                const cx = tag.center_x / scaleX;
+                const cy = tag.center_y / scaleY;
 
                 ctx.strokeStyle = "#00FF00";
                 ctx.lineWidth = 2;
