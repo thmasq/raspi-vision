@@ -65,25 +65,9 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
     let cy = (ymin + ymax) * 0.5 - 0.028581;
 
     for p in pts.iter_mut() {
-        let mut dx = p.x - cx;
-        let mut dy = p.y - cy;
-
-        let quadrant = if dy > 0.0 {
-            if dx > 0.0 { 131072.0 } else { 65536.0 }
-        } else {
-            if dx > 0.0 { 0.0 } else { -131072.0 }
-        };
-
-        if dy < 0.0 {
-            dy = -dy;
-            dx = -dx;
-        }
-        if dx < 0.0 {
-            let tmp = dx;
-            dx = dy;
-            dy = -tmp;
-        }
-        p.slope = quadrant + (dy / dx);
+        let dx = p.x - cx;
+        let dy = p.y - cy;
+        p.slope = dy.atan2(dx);
     }
 
     pts.sort_unstable_by(|a, b| a.slope.partial_cmp(&b.slope).unwrap());

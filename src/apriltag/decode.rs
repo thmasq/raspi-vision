@@ -876,23 +876,22 @@ pub fn extract_detection(
 
     let mut grid = [0.0f32; 64];
 
-    for i in 0..TAG36H11_NBITS {
-        let bx = TAG36H11_BIT_X[i];
-        let by = TAG36H11_BIT_Y[i];
+    for by in 0..8 {
+        for bx in 0..8 {
+            let tag_x = 2.0 * ((bx as f32 + 0.5) / 8.0) - 1.0;
+            let tag_y = 2.0 * ((by as f32 + 0.5) / 8.0) - 1.0;
 
-        let tag_x = 2.0 * ((bx as f32 + 0.5) / TAG36H11_WIDTH_AT_BORDER as f32) - 1.0;
-        let tag_y = 2.0 * ((by as f32 + 0.5) / TAG36H11_WIDTH_AT_BORDER as f32) - 1.0;
+            let (px, py) = homo.project(tag_x, tag_y);
 
-        let (px, py) = homo.project(tag_x, tag_y);
+            if let Some(val) = sample_pixel(image, px, py) {
+                let white_thresh = white_model.interpolate(tag_x, tag_y);
+                let black_thresh = black_model.interpolate(tag_x, tag_y);
+                let decision_thresh = (white_thresh + black_thresh) / 2.0;
 
-        if let Some(val) = sample_pixel(image, px, py) {
-            let white_thresh = white_model.interpolate(tag_x, tag_y);
-            let black_thresh = black_model.interpolate(tag_x, tag_y);
-            let decision_thresh = (white_thresh + black_thresh) / 2.0;
-
-            grid[by * 8 + bx] = val - decision_thresh;
-        } else {
-            return None;
+                grid[by * 8 + bx] = val - decision_thresh;
+            } else {
+                return None;
+            }
         }
     }
 
