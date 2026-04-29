@@ -6,6 +6,7 @@ rustflags = [
     "-C", "link-arg=--sysroot=/home/thomasq/pi-sysroot",
     "-C", "target-feature=-crt-static",
     "-C", "link-arg=-fuse-ld=lld",
+    "-C", "target-cpu=cortex-a53",
 ]
 
 [env]
