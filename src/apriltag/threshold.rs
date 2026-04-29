@@ -75,22 +75,22 @@ pub fn process(input: &Image, output: &mut Image) {
 
             let contrast = local_max.saturating_sub(local_min);
             let thresh = u16::from(local_min) + (u16::from(contrast) >> 1);
-
             let x_start = tx * TILE_SIZE;
 
-            for i in 0..TILE_SIZE {
-                let y = ty * TILE_SIZE + i;
+            if contrast < MIN_CONTRAST {
+                for i in 0..TILE_SIZE {
+                    let out_row_start = i * width + x_start;
+                    let out_row = &mut out_band[out_row_start..out_row_start + TILE_SIZE];
+                    out_row.fill(127);
+                }
+            } else {
+                for i in 0..TILE_SIZE {
+                    let y = ty * TILE_SIZE + i;
+                    let in_row = &input.row(y)[x_start..x_start + TILE_SIZE];
+                    let out_row_start = i * width + x_start;
+                    let out_row = &mut out_band[out_row_start..out_row_start + TILE_SIZE];
 
-                let in_row = &input.row(y)[x_start..x_start + TILE_SIZE];
-
-                let out_row_start = i * width + x_start;
-
-                let out_row = &mut out_band[out_row_start..out_row_start + TILE_SIZE];
-
-                for j in 0..TILE_SIZE {
-                    if contrast < MIN_CONTRAST {
-                        out_row[j] = 127;
-                    } else {
+                    for j in 0..TILE_SIZE {
                         out_row[j] = if u16::from(in_row[j]) > thresh {
                             255
                         } else {
