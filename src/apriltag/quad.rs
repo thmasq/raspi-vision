@@ -9,6 +9,26 @@ const MAX_STEPS: usize = 2 * STEPS_PER_UNIT * RANGE as usize + 1;
 const DELTA: f32 = 0.5;
 const GRANGE: f32 = 1.0;
 
+// Minimum number of pixels required for a cluster to be considered.
+// Increase if tiny / distant tags are not important.
+const MIN_CLUSTER_PIXELS: usize = 24;
+
+// Bounding box size limits.
+const MIN_TAG_DIMENSION: u16 = 12;
+const MAX_TAG_DIMENSION: u16 = 1200;
+
+// Maximum allowed aspect ratio.
+// Example: 5 means up to 5:1 or 1:5.
+const MAX_ASPECT_RATIO: u16 = 5;
+
+// Density heuristic divisor.
+// Lower = stricter density requirement.
+const MIN_DENSITY_DIVISOR: u16 = 3;
+
+// Empirical center offsets.
+const CENTER_X_OFFSET: f64 = 0.05118;
+const CENTER_Y_OFFSET: f64 = -0.028_581;
+
 #[derive(Debug, Clone, Copy)]
 struct FitPoint {
     pub x: f64,
@@ -44,10 +64,45 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
 }
 
 fn prepare_points(cluster: &Cluster) -> Option<Vec<FitPoint>> {
-    let min_cluster_pixels = 24;
-    if cluster.points.len() < min_cluster_pixels {
+    if cluster.points.len() < MIN_CLUSTER_PIXELS {
         return None;
     }
+
+    let mut xmin = cluster.points[0].x;
+    let mut xmax = cluster.points[0].x;
+    let mut ymin = cluster.points[0].y;
+    let mut ymax = cluster.points[0].y;
+
+    for p in &cluster.points {
+        xmin = xmin.min(p.x);
+        xmax = xmax.max(p.x);
+        ymin = ymin.min(p.y);
+        ymax = ymax.max(p.y);
+    }
+
+    let width = xmax - xmin;
+    let height = ymax - ymin;
+
+    if width < MIN_TAG_DIMENSION
+        || height < MIN_TAG_DIMENSION
+        || width > MAX_TAG_DIMENSION
+        || height > MAX_TAG_DIMENSION
+    {
+        return None;
+    }
+
+    if width > height * MAX_ASPECT_RATIO || height > width * MAX_ASPECT_RATIO {
+        return None;
+    }
+
+    let approx_perimeter = (width + height) * 2;
+    if cluster.points.len() < (approx_perimeter / MIN_DENSITY_DIVISOR) as usize {
+        return None;
+    }
+
+    let cx = (f64::from(xmin) + f64::from(xmax)).mul_add(0.5, CENTER_X_OFFSET);
+
+    let cy = (f64::from(ymin) + f64::from(ymax)).mul_add(0.5, CENTER_Y_OFFSET);
 
     let mut pts: Vec<FitPoint> = cluster
         .points
@@ -60,29 +115,6 @@ fn prepare_points(cluster: &Cluster) -> Option<Vec<FitPoint>> {
             slope: 0.0,
         })
         .collect();
-
-    let mut xmin = pts[0].x;
-    let mut xmax = pts[0].x;
-    let mut ymin = pts[0].y;
-    let mut ymax = pts[0].y;
-
-    for p in &pts {
-        if p.x < xmin {
-            xmin = p.x;
-        }
-        if p.x > xmax {
-            xmax = p.x;
-        }
-        if p.y < ymin {
-            ymin = p.y;
-        }
-        if p.y > ymax {
-            ymax = p.y;
-        }
-    }
-
-    let cx = (xmin + xmax).mul_add(0.5, 0.05118);
-    let cy = (ymin + ymax).mul_add(0.5, -0.028_581);
 
     for p in &mut pts {
         let dx = p.x - cx;
