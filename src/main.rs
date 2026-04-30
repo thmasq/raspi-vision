@@ -180,15 +180,15 @@ fn capture_loop(
         .expect("Failed to configure camera");
 
     let mut allocator = libcamera::framebuffer_allocator::FrameBufferAllocator::new(&camera);
-    let stream_full = config.get(0).unwrap().stream().unwrap().clone();
-    let stream_vga = config.get(1).unwrap().stream().unwrap().clone();
+    let stream_full = config.get(0).unwrap().stream().unwrap();
+    let stream_vga = config.get(1).unwrap().stream().unwrap();
 
     let allocated_buffers_full = allocator.alloc(&stream_full).unwrap();
     let allocated_buffers_vga = allocator.alloc(&stream_vga).unwrap();
 
     let requests: Vec<_> = allocated_buffers_full
         .into_iter()
-        .zip(allocated_buffers_vga.into_iter())
+        .zip(allocated_buffers_vga)
         .map(|(buf_full, buf_vga)| {
             let mut request = camera.create_request(None).unwrap();
 
@@ -425,8 +425,7 @@ fn capture_loop(
         let frame_copy_vga = raw_data_vga.to_vec();
 
         match frame_tx.try_send((frame_copy_full, frame_copy_vga)) {
-            Ok(_) => {}
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 eprintln!("Pipeline thread panicked or disconnected!");
                 break;

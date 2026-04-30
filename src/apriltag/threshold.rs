@@ -1,7 +1,10 @@
 use crate::apriltag::image::Image;
 
 #[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
+use core::arch::aarch64::{
+    vbslq_u8, vcgtq_u8, vdupq_n_u8, vdupq_n_u32, vextq_u8, vgetq_lane_u8, vld1q_u8, vmaxq_u8,
+    vminq_u8, vreinterpretq_u8_u32, vsetq_lane_u32, vst1q_u8,
+};
 #[cfg(target_arch = "aarch64")]
 use core::arch::asm;
 
@@ -148,8 +151,8 @@ pub unsafe fn process(input: &Image, output: &mut Image) {
                     0x00_u8
                 };
 
-                let thresh_32 = (thresh as u32) * 0x01010101;
-                let mask_32 = (low_contrast as u32) * 0x01010101;
+                let thresh_32 = u32::from(thresh) * 0x0101_0101;
+                let mask_32 = u32::from(low_contrast) * 0x0101_0101;
 
                 match j {
                     0 => {
@@ -182,7 +185,7 @@ pub unsafe fn process(input: &Image, output: &mut Image) {
                         vst1q_u8(
                             out_slice.get_unchecked_mut(out_idx..).as_mut_ptr(),
                             fill_127_vec,
-                        )
+                        );
                     };
                 }
             } else {
@@ -204,7 +207,7 @@ pub unsafe fn process(input: &Image, output: &mut Image) {
                         vst1q_u8(
                             out_slice.get_unchecked_mut(out_idx..).as_mut_ptr(),
                             final_out,
-                        )
+                        );
                     };
                 }
             }
