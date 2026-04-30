@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
-libcamera = "0.7.0"
+libcamera = { version = "0.7.0", features = ["vendor_draft"] }
 nalgebra = { version = "0.34.2", features = ["serde-serialize"] }
 rustc-hash = "2.1.2"
 serde = { version = "1.0.228", features = ["derive"] }

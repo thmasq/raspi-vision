@@ -66,9 +66,9 @@ async fn main() {
     let (tx_tags, _) = broadcast::channel::<String>(16);
 
     let (controls_tx, controls_rx) = watch::channel(CameraControls {
-        ae_enable: true,
-        exposure_time: 20000,
-        analogue_gain: 1.0,
+        ae_enable: false,
+        exposure_time: 30000,
+        analogue_gain: 7.0,
         debug_view: DebugView::Raw,
     });
 
@@ -442,14 +442,17 @@ fn capture_loop(
             .set(controls::AeEnable(current_controls.ae_enable))
             .unwrap();
 
-        if !current_controls.ae_enable {
-            controls
-                .set(controls::ExposureTime(current_controls.exposure_time))
-                .unwrap();
-            controls
-                .set(controls::AnalogueGain(current_controls.analogue_gain))
-                .unwrap();
-        }
+        controls
+            .set(controls::ExposureTime(current_controls.exposure_time))
+            .unwrap();
+        controls
+            .set(controls::AnalogueGain(current_controls.analogue_gain))
+            .unwrap();
+
+        controls.set(controls::AwbEnable(false)).unwrap();
+        controls.set(controls::Saturation(0.0)).unwrap();
+        controls.set(controls::Sharpness(0.0)).unwrap();
+        controls.set(controls::NoiseReductionMode::Off).unwrap();
 
         camera.queue_request(req).unwrap();
     }
