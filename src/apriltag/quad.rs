@@ -1,6 +1,6 @@
 #![allow(clippy::inline_always)]
 
-use crate::apriltag::{image::Image, unionfind::Cluster};
+use crate::apriltag::{image::Image, unionfind::Point};
 
 const RANGE: f32 = 2.0;
 const STEPS_PER_UNIT: usize = 4;
@@ -52,8 +52,8 @@ struct LineFitPt {
 
 /// Fits a quadrilateral to a point cloud cluster representing a tag boundary.
 /// Replicates `fit_quad` and `quad_segment_maxima` from the official C pipeline.
-pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
-    let pts = prepare_points(cluster)?;
+pub fn find_quad_corners(points_slice: &[(u64, Point)]) -> Option<[[f32; 2]; 4]> {
+    let pts = prepare_points(points_slice)?;
     let lfps = compute_lfps(&pts);
 
     let errs = compute_corner_response(&pts, &lfps)?;
@@ -63,17 +63,18 @@ pub fn find_quad_corners(cluster: &Cluster) -> Option<[[f32; 2]; 4]> {
     intersect_quad_lines(&lfps, pts.len(), quad)
 }
 
-fn prepare_points(cluster: &Cluster) -> Option<Vec<FitPoint>> {
-    if cluster.points.len() < MIN_CLUSTER_PIXELS {
+fn prepare_points(points: &[(u64, Point)]) -> Option<Vec<FitPoint>> {
+    if points.len() < MIN_CLUSTER_PIXELS {
         return None;
     }
 
-    let mut xmin = cluster.points[0].x;
-    let mut xmax = cluster.points[0].x;
-    let mut ymin = cluster.points[0].y;
-    let mut ymax = cluster.points[0].y;
+    // Access the Point struct using .1 from the tuple
+    let mut xmin = points[0].1.x;
+    let mut xmax = points[0].1.x;
+    let mut ymin = points[0].1.y;
+    let mut ymax = points[0].1.y;
 
-    for p in &cluster.points {
+    for (_, p) in points {
         xmin = xmin.min(p.x);
         xmax = xmax.max(p.x);
         ymin = ymin.min(p.y);
@@ -96,18 +97,16 @@ fn prepare_points(cluster: &Cluster) -> Option<Vec<FitPoint>> {
     }
 
     let approx_perimeter = (width + height) * 2;
-    if cluster.points.len() < (approx_perimeter / MIN_DENSITY_DIVISOR) as usize {
+    if points.len() < (approx_perimeter / MIN_DENSITY_DIVISOR) as usize {
         return None;
     }
 
     let cx = (f64::from(xmin) + f64::from(xmax)).mul_add(0.5, CENTER_X_OFFSET);
-
     let cy = (f64::from(ymin) + f64::from(ymax)).mul_add(0.5, CENTER_Y_OFFSET);
 
-    let mut pts: Vec<FitPoint> = cluster
-        .points
+    let mut pts: Vec<FitPoint> = points
         .iter()
-        .map(|p| FitPoint {
+        .map(|(_, p)| FitPoint {
             x: f64::from(p.x),
             y: f64::from(p.y),
             gx: f64::from(p.gx),

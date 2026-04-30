@@ -224,8 +224,7 @@ fn capture_loop(
     let controls_rx_pipe = controls_rx.clone();
 
     std::thread::spawn(move || {
-        let mut global_uf =
-            crate::apriltag::unionfind::UnionFind::new((CAPTURE_WIDTH * CAPTURE_HEIGHT) as u32);
+        let mut global_uf = crate::apriltag::unionfind::UnionFind::new();
         let mut mono_image =
             crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
         let mut threshold_img =
@@ -327,7 +326,10 @@ fn capture_loop(
                     let scale_y = CAPTURE_HEIGHT as f32 / STREAM_HEIGHT as f32;
 
                     for cluster in &clusters {
-                        for pt in &cluster.points {
+                        let points_slice =
+                            &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
+
+                        for &(_, pt) in points_slice {
                             let px = ((f32::from(pt.x) / 2.0) / scale_x) as usize;
                             let py = ((f32::from(pt.y) / 2.0) / scale_y) as usize;
                             let idx = py * STREAM_WIDTH + px;
@@ -346,7 +348,8 @@ fn capture_loop(
             let mut valid_detections: Vec<_> = clusters
                 .iter()
                 .filter_map(|cluster| {
-                    let corners = find_quad_corners(cluster)?;
+                    let points_slice = &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
+                    let corners = find_quad_corners(points_slice)?;
                     extract_detection(&mono_image, &corners, &intrinsics, &quick_decode)
                 })
                 .collect();

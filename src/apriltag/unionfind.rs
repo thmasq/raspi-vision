@@ -1,7 +1,7 @@
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
 pub struct Cluster {
-    pub id: u64,
-    pub points: Vec<Point>,
+    pub start_idx: usize,
+    pub end_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -12,44 +12,57 @@ pub struct Point {
     pub gy: i16,
 }
 
-/// A pixel-based Union-Find implementation.
+#[derive(Debug, Clone, Copy)]
+pub struct Run {
+    pub x_start: u16,
+    pub x_end: u16,
+    pub color: u8,
+    pub id: u32,
+}
+
+/// A Run-Length based Union-Find implementation tailored for AprilTag.
 pub struct UnionFind {
-    pub maxid: u32,
-    /// Parent node for each element. Initialized to `u32::MAX`.
+    /// Parent node for each run element.
     pub parent: Vec<u32>,
-    /// The size of the tree excluding the root.
+    /// The absolute pixel count (size) of the tree.
     pub size: Vec<u32>,
     /// Persistent arena for boundary points.
     pub edge_buffer: Vec<(u64, Point)>,
+    /// Flat buffer of all extracted horizontal runs.
+    pub runs: Vec<Run>,
+    /// Indices indicating where each row starts in the `runs` vector.
+    pub row_starts: Vec<usize>,
+    /// A persistent buffer for the current row's run IDs, used to avoid heap allocation during gradient clustering.
+    pub row_y_runs: Vec<u32>,
+    /// A persistent buffer for the next row's run IDs, used in conjunction with `row_y_runs` for row-by-row scanning.
+    pub row_y1_runs: Vec<u32>,
 }
 
 impl UnionFind {
-    /// Creates a new `UnionFind` structure capable of holding up to `maxid` elements.
-    pub fn new(maxid: u32) -> Self {
-        let len = (maxid + 1) as usize;
+    /// Creates a new `UnionFind` structure.
+    pub fn new() -> Self {
         Self {
-            maxid,
-            parent: vec![u32::MAX; len],
-            size: vec![0; len],
+            parent: Vec::with_capacity(20_000),
+            size: Vec::with_capacity(20_000),
+            runs: Vec::with_capacity(20_000),
+            row_starts: Vec::with_capacity(1000),
             edge_buffer: Vec::with_capacity(250_000),
+            row_y_runs: vec![u32::MAX; 1296],
+            row_y1_runs: vec![u32::MAX; 1296],
         }
     }
 
     /// Compresses all paths in the tree so lookups are instant
     pub fn flatten(&mut self) {
-        for i in 0..self.maxid {
-            if self.parent[i as usize] != u32::MAX {
-                self.get_representative(i);
-            }
+        let len = self.parent.len() as u32;
+        for i in 0..len {
+            self.get_representative(i);
         }
     }
 
     /// Read-only representative fetcher (Assumes tree is flattened)
     pub fn get_representative_readonly(&self, mut id: u32) -> u32 {
         let mut idx = id as usize;
-        if self.parent[idx] == u32::MAX {
-            return id;
-        }
         while self.parent[idx] != id {
             id = self.parent[idx];
             idx = id as usize;
@@ -59,20 +72,16 @@ impl UnionFind {
 
     /// Resets the `UnionFind` structure so it can be reused without reallocating.
     pub fn clear(&mut self) {
-        self.parent.fill(u32::MAX);
-        self.size.fill(0);
+        self.parent.clear();
+        self.size.clear();
+        self.runs.clear();
+        self.row_starts.clear();
         self.edge_buffer.clear();
     }
 
     /// Finds the representative (root) of the set containing `id`.
-    /// Includes "Path Halving" optimization and lazy initialization.
     pub fn get_representative(&mut self, mut id: u32) -> u32 {
         let mut idx = id as usize;
-
-        if self.parent[idx] == u32::MAX {
-            self.parent[idx] = id;
-            return id;
-        }
 
         while self.parent[idx] != id {
             let parent_id = self.parent[idx];
@@ -90,7 +99,7 @@ impl UnionFind {
     #[allow(dead_code)]
     pub fn get_set_size(&mut self, id: u32) -> u32 {
         let repid = self.get_representative(id);
-        self.size[repid as usize] + 1
+        self.size[repid as usize]
     }
 
     /// Connects (unions) the sets containing `aid` and `bid`.
@@ -103,8 +112,8 @@ impl UnionFind {
             return aroot;
         }
 
-        let asize = self.size[aroot as usize] + 1;
-        let bsize = self.size[broot as usize] + 1;
+        let asize = self.size[aroot as usize];
+        let bsize = self.size[broot as usize];
 
         if asize > bsize {
             self.parent[broot as usize] = aroot;
@@ -117,48 +126,85 @@ impl UnionFind {
         }
     }
 
-    /// 4-connected (and partially 8-connected) union find on the thresholded image pixels
+    /// Extracts runs and connects them using strictly 4-way for black and 8-way for white.
     pub fn connected_components(&mut self, im: &[u8], w: usize, h: usize) {
+        self.clear();
         const BG_CHUNK: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 
         for y in 0..h {
+            self.row_starts.push(self.runs.len());
+            let y_offset = y * w;
             let mut x = 0;
 
-            while x < w {
-                let idx = y * w + x;
+            let prev_start = if y > 0 { self.row_starts[y - 1] } else { 0 };
+            let prev_end = if y > 0 { self.row_starts[y] } else { 0 };
+            let mut prev_idx = prev_start;
 
+            while x < w {
                 if x + 8 <= w {
-                    let chunk = u64::from_ne_bytes(im[idx..idx + 8].try_into().unwrap());
+                    let chunk =
+                        u64::from_ne_bytes(im[y_offset + x..y_offset + x + 8].try_into().unwrap());
                     if chunk == BG_CHUNK {
                         x += 8;
                         continue;
                     }
                 }
 
-                let v = im[idx];
-
+                let v = im[y_offset + x];
                 if v == 127 {
                     x += 1;
                     continue;
                 }
 
-                if x > 0 && im[idx - 1] == v {
-                    self.connect(idx as u32, (idx - 1) as u32);
-                }
-                if y > 0 && im[idx - w] == v {
-                    self.connect(idx as u32, (idx - w) as u32);
-                }
-
-                if v == 255 {
-                    if x > 0 && y > 0 && im[idx - w - 1] == v {
-                        self.connect(idx as u32, (idx - w - 1) as u32);
-                    }
-                    if x + 1 < w && y > 0 && im[idx - w + 1] == v {
-                        self.connect(idx as u32, (idx - w + 1) as u32);
-                    }
-                }
-
+                let color = v;
+                let start_x = x;
                 x += 1;
+
+                while x < w && im[y_offset + x] == color {
+                    x += 1;
+                }
+                let end_x = x - 1;
+
+                let run_id = self.parent.len() as u32;
+                self.parent.push(run_id);
+                self.size.push((end_x - start_x + 1) as u32);
+                self.runs.push(Run {
+                    x_start: start_x as u16,
+                    x_end: end_x as u16,
+                    color,
+                    id: run_id,
+                });
+
+                if y > 0 {
+                    let expand = if color == 255 { 1 } else { 0 };
+                    let match_start = start_x.saturating_sub(expand) as u16;
+                    let match_end = (end_x + expand).min(w - 1) as u16;
+
+                    while prev_idx < prev_end && self.runs[prev_idx].x_end < match_start {
+                        prev_idx += 1;
+                    }
+
+                    let mut scan_idx = prev_idx;
+                    while scan_idx < prev_end && self.runs[scan_idx].x_start <= match_end {
+                        if self.runs[scan_idx].color == color {
+                            self.connect(run_id, self.runs[scan_idx].id);
+                        }
+                        scan_idx += 1;
+                    }
+                }
+            }
+        }
+        self.row_starts.push(self.runs.len());
+    }
+
+    #[inline(always)]
+    fn fill_run_buffer(&self, buffer: &mut [u32], y: usize) {
+        buffer.fill(u32::MAX);
+        let start = self.row_starts[y];
+        let end = self.row_starts[y + 1];
+        for run in &self.runs[start..end] {
+            for x in run.x_start..=run.x_end {
+                buffer[x as usize] = run.id;
             }
         }
     }
@@ -166,8 +212,22 @@ impl UnionFind {
     /// Extract boundary clusters (gradient boundary points)
     pub fn gradient_clusters(&mut self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
         self.edge_buffer.clear();
+        self.flatten();
+
+        let mut row_y_runs = std::mem::replace(&mut self.row_y_runs, Vec::new());
+        let mut row_y1_runs = std::mem::replace(&mut self.row_y1_runs, Vec::new());
+
+        if row_y_runs.len() < w {
+            row_y_runs.resize(w, u32::MAX);
+        }
+        if row_y1_runs.len() < w {
+            row_y1_runs.resize(w, u32::MAX);
+        }
+
+        self.fill_run_buffer(&mut row_y_runs, 0);
 
         for y in 0..(h - 1) {
+            self.fill_run_buffer(&mut row_y1_runs, y + 1);
             let mut connected_last = false;
 
             for x in 1..(w - 1) {
@@ -179,8 +239,14 @@ impl UnionFind {
                     continue;
                 }
 
-                let rep0 = self.get_representative_readonly(idx0 as u32);
-                let size0 = self.size[rep0 as usize] + 1;
+                let run0 = row_y_runs[x];
+                if run0 == u32::MAX {
+                    connected_last = false;
+                    continue;
+                }
+
+                let rep0 = self.get_representative_readonly(run0);
+                let size0 = self.size[rep0 as usize];
 
                 if size0 < 25 {
                     connected_last = false;
@@ -195,8 +261,18 @@ impl UnionFind {
                     let v1 = im[idx1];
 
                     if v1 != 127 && (u16::from(v0) + u16::from(v1)) == 255 {
-                        let rep1 = self.get_representative_readonly(idx1 as u32);
-                        let size1 = self.size[rep1 as usize] + 1;
+                        let run1 = if dy == 0 {
+                            row_y_runs[nx]
+                        } else {
+                            row_y1_runs[nx]
+                        };
+
+                        if run1 == u32::MAX {
+                            return false;
+                        }
+
+                        let rep1 = self.get_representative_readonly(run1);
+                        let size1 = self.size[rep1 as usize];
 
                         if size1 >= 25 {
                             let clusterid = if rep0 < rep1 {
@@ -236,9 +312,14 @@ impl UnionFind {
                 connected |= check_conn(1, 1);
                 connected_last = connected;
             }
+
+            std::mem::swap(&mut row_y_runs, &mut row_y1_runs);
         }
 
-        self.edge_buffer.sort_unstable_by_key(|&(id, _)| id);
+        self.row_y_runs = row_y_runs;
+        self.row_y1_runs = row_y1_runs;
+
+        radsort::sort_by_key(&mut self.edge_buffer, |&(id, _)| id);
 
         let mut clusters = Vec::new();
         let mut chunk_start = 0;
@@ -255,14 +336,9 @@ impl UnionFind {
             let chunk_size = chunk_end - chunk_start;
 
             if chunk_size >= 24 {
-                let points: Vec<Point> = self.edge_buffer[chunk_start..chunk_end]
-                    .iter()
-                    .map(|&(_, p)| p)
-                    .collect();
-
                 clusters.push(Cluster {
-                    id: current_id,
-                    points,
+                    start_idx: chunk_start,
+                    end_idx: chunk_end,
                 });
             }
 
