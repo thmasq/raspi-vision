@@ -280,7 +280,7 @@ fn capture_loop(
             let t_downsample = t_start.elapsed();
 
             let t_start = Instant::now();
-            crate::apriltag::threshold::process(&mono_image, &mut threshold_img);
+            unsafe { crate::apriltag::threshold::process(&mono_image, &mut threshold_img) };
             let t_thresh = t_start.elapsed();
 
             let t_start = Instant::now();
