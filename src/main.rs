@@ -146,8 +146,12 @@ fn capture_loop(
     let mut camera = cam.acquire().expect("Failed to acquire camera");
 
     let mut config = camera
-        .generate_configuration(&[libcamera::stream::StreamRole::VideoRecording])
+        .generate_configuration(&[
+            libcamera::stream::StreamRole::VideoRecording,
+            libcamera::stream::StreamRole::ViewFinder,
+        ])
         .unwrap();
+
     {
         let mut stream_cfg = config.get_mut(0).unwrap();
         stream_cfg.set_size(libcamera::geometry::Size {
@@ -157,23 +161,43 @@ fn capture_loop(
         stream_cfg.set_pixel_format(formats::YUV420);
     }
 
+    {
+        let mut stream_cfg = config.get_mut(1).unwrap();
+        stream_cfg.set_size(libcamera::geometry::Size {
+            width: STREAM_WIDTH as u32,
+            height: STREAM_HEIGHT as u32,
+        });
+        stream_cfg.set_pixel_format(formats::YUV420);
+    }
+
     config.validate();
+
     let capture_stride = config.get(0).unwrap().get_stride() as usize;
+    let vga_stride = config.get(1).unwrap().get_stride() as usize;
 
     camera
         .configure(&mut config)
         .expect("Failed to configure camera");
 
     let mut allocator = libcamera::framebuffer_allocator::FrameBufferAllocator::new(&camera);
-    let stream = config.get(0).unwrap().stream().unwrap();
-    let allocated_buffers = allocator.alloc(&stream).unwrap();
+    let stream_full = config.get(0).unwrap().stream().unwrap().clone();
+    let stream_vga = config.get(1).unwrap().stream().unwrap().clone();
 
-    let requests: Vec<_> = allocated_buffers
+    let allocated_buffers_full = allocator.alloc(&stream_full).unwrap();
+    let allocated_buffers_vga = allocator.alloc(&stream_vga).unwrap();
+
+    let requests: Vec<_> = allocated_buffers_full
         .into_iter()
-        .map(|buffer| {
+        .zip(allocated_buffers_vga.into_iter())
+        .map(|(buf_full, buf_vga)| {
             let mut request = camera.create_request(None).unwrap();
-            let mapped_buffer = MemoryMappedFrameBuffer::new(buffer).unwrap();
-            request.add_buffer(&stream, mapped_buffer).unwrap();
+
+            let mapped_full = MemoryMappedFrameBuffer::new(buf_full).unwrap();
+            request.add_buffer(&stream_full, mapped_full).unwrap();
+
+            let mapped_vga = MemoryMappedFrameBuffer::new(buf_vga).unwrap();
+            request.add_buffer(&stream_vga, mapped_vga).unwrap();
+
             request
         })
         .collect();
@@ -189,9 +213,11 @@ fn capture_loop(
         cam_tx.send(req).unwrap();
     });
 
-    println!("Starting capture loop at {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}...");
+    println!(
+        "Starting dual-stream capture loop: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} and {STREAM_WIDTH}x{STREAM_HEIGHT}..."
+    );
 
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Vec<u8>)>(1);
 
     let tx_video_pipe = tx_video.clone();
     let tx_tags_pipe = tx_tags.clone();
@@ -214,15 +240,6 @@ fn capture_loop(
 
         let quick_decode = QuickDecode::new();
 
-        let mut vga_lut_raw: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
-        for y in 0..STREAM_HEIGHT {
-            let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
-            for x in 0..STREAM_WIDTH {
-                let src_x = x * CAPTURE_WIDTH / STREAM_WIDTH;
-                vga_lut_raw.push(src_y * capture_stride + src_x);
-            }
-        }
-
         let mut vga_lut_dense: Vec<usize> = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT);
         for y in 0..STREAM_HEIGHT {
             let src_y = y * CAPTURE_HEIGHT / STREAM_HEIGHT;
@@ -232,12 +249,10 @@ fn capture_loop(
             }
         }
 
-        let mut stream_bytes = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
-
         let mut frames_processed = 0;
         let mut pipe_fps_timer = Instant::now();
 
-        for raw_frame in frame_rx {
+        for (raw_frame_full, raw_frame_vga) in frame_rx {
             frames_processed += 1;
             if pipe_fps_timer.elapsed() >= Duration::from_secs(1) {
                 println!("Pipeline FPS: {frames_processed}");
@@ -252,19 +267,16 @@ fn capture_loop(
             let mono_slice = mono_image.as_mut_slice();
 
             if capture_stride == CAPTURE_WIDTH {
-                mono_slice.copy_from_slice(&raw_frame[..CAPTURE_WIDTH * CAPTURE_HEIGHT]);
+                mono_slice.copy_from_slice(&raw_frame_full[..CAPTURE_WIDTH * CAPTURE_HEIGHT]);
             } else {
                 for y in 0..CAPTURE_HEIGHT {
                     let src_offset = y * capture_stride;
                     let dst_offset = y * CAPTURE_WIDTH;
                     mono_slice[dst_offset..dst_offset + CAPTURE_WIDTH]
-                        .copy_from_slice(&raw_frame[src_offset..src_offset + CAPTURE_WIDTH]);
+                        .copy_from_slice(&raw_frame_full[src_offset..src_offset + CAPTURE_WIDTH]);
                 }
             }
 
-            for (dst_pixel, &src_idx) in stream_bytes.iter_mut().zip(&vga_lut_raw) {
-                *dst_pixel = raw_frame[src_idx];
-            }
             let t_downsample = t_start.elapsed();
 
             let t_start = Instant::now();
@@ -286,7 +298,21 @@ fn capture_loop(
             let t_cluster = t_start.elapsed();
 
             let debug_frame = match current_controls.debug_view {
-                DebugView::Raw => stream_bytes.clone(),
+                DebugView::Raw => {
+                    let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+                    if vga_stride == STREAM_WIDTH {
+                        buf.copy_from_slice(&raw_frame_vga[..STREAM_WIDTH * STREAM_HEIGHT]);
+                    } else {
+                        for y in 0..STREAM_HEIGHT {
+                            let src_offset = y * vga_stride;
+                            let dst_offset = y * STREAM_WIDTH;
+                            buf[dst_offset..dst_offset + STREAM_WIDTH].copy_from_slice(
+                                &raw_frame_vga[src_offset..src_offset + STREAM_WIDTH],
+                            );
+                        }
+                    }
+                    buf
+                }
                 DebugView::Threshold => {
                     let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
                     let thresh_slice = threshold_img.as_slice();
@@ -351,7 +377,7 @@ fn capture_loop(
             let total_pipe = pipe_start.elapsed();
 
             println!(
-                "Pipe: {total_pipe:?} | Prep: {t_downsample:?}, Thresh: {t_thresh:?}, UF: {t_uf:?}, Cluster: {t_cluster:?}, Decode: {t_decode:?}"
+                "Pipe: {total_pipe:?} | HW Downsample: {t_downsample:?}, Thresh: {t_thresh:?}, UF: {t_uf:?}, Cluster: {t_cluster:?}, Decode: {t_decode:?}"
             );
 
             let top_detections: Vec<_> = filtered_detections.into_iter().take(10).collect();
@@ -374,10 +400,19 @@ fn capture_loop(
     loop {
         let mut req = cam_rx.recv().unwrap();
 
-        let buffer: &MemoryMappedFrameBuffer<FrameBuffer> =
-            req.buffer(&stream).expect("Failed to get buffer");
-        let planes_data = buffer.data();
-        let raw_data = planes_data.first().expect("Buffer has no plane data");
+        let buffer_full: &MemoryMappedFrameBuffer<FrameBuffer> =
+            req.buffer(&stream_full).expect("Failed to get full buffer");
+        let planes_data_full = buffer_full.data();
+        let raw_data_full = planes_data_full
+            .first()
+            .expect("Full buffer has no plane data");
+
+        let buffer_vga: &MemoryMappedFrameBuffer<FrameBuffer> =
+            req.buffer(&stream_vga).expect("Failed to get VGA buffer");
+        let planes_data_vga = buffer_vga.data();
+        let raw_data_vga = planes_data_vga
+            .first()
+            .expect("VGA buffer has no plane data");
 
         frames_captured += 1;
         if fps_timer.elapsed() >= Duration::from_secs(1) {
@@ -386,9 +421,10 @@ fn capture_loop(
             fps_timer = Instant::now();
         }
 
-        let frame_copy = raw_data.to_vec();
+        let frame_copy_full = raw_data_full.to_vec();
+        let frame_copy_vga = raw_data_vga.to_vec();
 
-        match frame_tx.try_send(frame_copy) {
+        match frame_tx.try_send((frame_copy_full, frame_copy_vga)) {
             Ok(_) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {}
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
