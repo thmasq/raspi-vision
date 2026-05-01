@@ -313,7 +313,7 @@ fn compute_lfps(pts: &[FitPoint]) -> Vec<LineFitPt> {
         let p = &pts[i];
         let x = p.x.mul_add(0.5, 0.5);
         let y = p.y.mul_add(0.5, 0.5);
-        let w = p.gx.hypot(p.gy) + 1.0;
+        let w = (p.gx * p.gx + p.gy * p.gy).sqrt() + 1.0;
 
         weights[i] = w;
         w_x[i] = w * x;
@@ -471,7 +471,7 @@ pub fn refine_edges(image: &Image, corners: &mut [[f32; 2]; 4]) {
         let mut nx = corners[b][1] - corners[a][1];
         let mut ny = -corners[b][0] + corners[a][0];
 
-        let mag = nx.hypot(ny);
+        let mag = (nx * nx + ny * ny).sqrt();
         if mag < 1e-5 {
             continue;
         }

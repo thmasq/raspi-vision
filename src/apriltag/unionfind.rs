@@ -60,16 +60,6 @@ impl UnionFind {
         }
     }
 
-    /// Read-only representative fetcher (Assumes tree is flattened)
-    pub fn get_representative_readonly(&self, mut id: u32) -> u32 {
-        let mut idx = id as usize;
-        while self.parent[idx] != id {
-            id = self.parent[idx];
-            idx = id as usize;
-        }
-        id
-    }
-
     /// Resets the `UnionFind` structure so it can be reused without reallocating.
     pub fn clear(&mut self) {
         self.parent.clear();
@@ -226,91 +216,103 @@ impl UnionFind {
 
         self.fill_run_buffer(&mut row_y_runs, 0);
 
+        const BG_CHUNK: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+
         for y in 0..(h - 1) {
             self.fill_run_buffer(&mut row_y1_runs, y + 1);
             let mut connected_last = false;
 
-            for x in 1..(w - 1) {
-                let idx0 = y * w + x;
-                let v0 = im[idx0];
+            let row_im = &im[y * w..(y + 1) * w];
+            let next_row_im = &im[(y + 1) * w..(y + 2) * w];
 
+            let mut x = 1;
+            while x < w - 1 {
+                if x + 8 <= w - 1 {
+                    let chunk = u64::from_ne_bytes(row_im[x..x + 8].try_into().unwrap());
+                    if chunk == BG_CHUNK {
+                        x += 8;
+                        connected_last = false;
+                        continue;
+                    }
+                }
+
+                let v0 = row_im[x];
                 if v0 == 127 {
                     connected_last = false;
+                    x += 1;
                     continue;
                 }
 
                 let run0 = row_y_runs[x];
                 if run0 == u32::MAX {
                     connected_last = false;
+                    x += 1;
                     continue;
                 }
 
-                let rep0 = self.get_representative_readonly(run0);
+                let rep0 = self.parent[run0 as usize];
                 let size0 = self.size[rep0 as usize];
 
                 if size0 < 25 {
                     connected_last = false;
+                    x += 1;
                     continue;
                 }
 
-                let mut check_conn = |dx: isize, dy: isize| -> bool {
-                    let nx = (x as isize + dx) as usize;
-                    let ny = (y as isize + dy) as usize;
-
-                    let idx1 = ny * w + nx;
-                    let v1 = im[idx1];
-
-                    if v1 != 127 && (u16::from(v0) + u16::from(v1)) == 255 {
-                        let run1 = if dy == 0 {
-                            row_y_runs[nx]
-                        } else {
-                            row_y1_runs[nx]
-                        };
-
-                        if run1 == u32::MAX {
-                            return false;
-                        }
-
-                        let rep1 = self.get_representative_readonly(run1);
-                        let size1 = self.size[rep1 as usize];
-
-                        if size1 >= 25 {
-                            let clusterid = if rep0 < rep1 {
-                                u64::from(rep1) << 32 | u64::from(rep0)
-                            } else {
-                                u64::from(rep0) << 32 | u64::from(rep1)
-                            };
-
-                            let gx = dx as i16 * (i16::from(v1) - i16::from(v0));
-                            let gy = dy as i16 * (i16::from(v1) - i16::from(v0));
-
-                            self.edge_buffer.push((
-                                clusterid,
-                                Point {
-                                    x: (2 * x as isize + dx) as u16,
-                                    y: (2 * y as isize + dy) as u16,
-                                    gx,
-                                    gy,
-                                },
-                            ));
-
-                            return true;
-                        }
-                    }
-
-                    false
-                };
-
                 let mut connected = false;
-                connected |= check_conn(1, 0);
-                connected |= check_conn(0, 1);
 
-                if !connected_last {
-                    connected |= check_conn(-1, 1);
+                macro_rules! check_neighbor {
+                    ($dx:expr, $dy:expr, $v1:expr, $run_arr:expr, $nx:expr) => {
+                        if (v0 ^ $v1) == 255 {
+                            let run1 = $run_arr[$nx];
+                            if run1 != u32::MAX {
+                                let rep1 = self.parent[run1 as usize];
+                                if self.size[rep1 as usize] >= 25 {
+                                    let clusterid = if rep0 < rep1 {
+                                        u64::from(rep1) << 32 | u64::from(rep0)
+                                    } else {
+                                        u64::from(rep0) << 32 | u64::from(rep1)
+                                    };
+
+                                    let gx = $dx as i16 * (i16::from($v1) - i16::from(v0));
+                                    let gy = $dy as i16 * (i16::from($v1) - i16::from(v0));
+
+                                    self.edge_buffer.push((
+                                        clusterid,
+                                        Point {
+                                            x: (2 * x as isize + $dx) as u16,
+                                            y: (2 * y as isize + $dy) as u16,
+                                            gx,
+                                            gy,
+                                        },
+                                    ));
+                                    connected = true;
+                                }
+                            }
+                        }
+                    };
                 }
 
-                connected |= check_conn(1, 1);
+                // Right
+                let v_right = row_im[x + 1];
+                check_neighbor!(1, 0, v_right, row_y_runs, x + 1);
+
+                // Down
+                let v_down = next_row_im[x];
+                check_neighbor!(0, 1, v_down, row_y1_runs, x);
+
+                // Down-Left
+                if !connected_last {
+                    let v_down_left = next_row_im[x - 1];
+                    check_neighbor!(-1, 1, v_down_left, row_y1_runs, x - 1);
+                }
+
+                // Down-Right
+                let v_down_right = next_row_im[x + 1];
+                check_neighbor!(1, 1, v_down_right, row_y1_runs, x + 1);
+
                 connected_last = connected;
+                x += 1;
             }
 
             std::mem::swap(&mut row_y_runs, &mut row_y1_runs);
@@ -333,9 +335,7 @@ impl UnionFind {
                 chunk_end += 1;
             }
 
-            let chunk_size = chunk_end - chunk_start;
-
-            if chunk_size >= 24 {
+            if chunk_end - chunk_start >= 24 {
                 clusters.push(Cluster {
                     start_idx: chunk_start,
                     end_idx: chunk_end,
