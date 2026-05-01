@@ -30,7 +30,7 @@ const CENTER_X_OFFSET: f64 = 0.05118;
 const CENTER_Y_OFFSET: f64 = -0.028_581;
 
 #[derive(Debug, Clone, Copy)]
-struct FitPoint {
+pub struct FitPoint {
     pub x: f64,
     pub y: f64,
     pub gx: f64,
@@ -41,7 +41,7 @@ struct FitPoint {
 /// Stores cumulative moments for O(1) line fitting queries.
 /// Equivalent to `struct line_fit_pt` in the C library.
 #[derive(Default, Clone, Copy)]
-struct LineFitPt {
+pub struct LineFitPt {
     pub mx: f64,
     pub my: f64,
     pub mxx: f64,
@@ -50,22 +50,52 @@ struct LineFitPt {
     pub w: f64,
 }
 
-/// Fits a quadrilateral to a point cloud cluster representing a tag boundary.
-/// Replicates `fit_quad` and `quad_segment_maxima` from the official C pipeline.
-pub fn find_quad_corners(points_slice: &[(u64, Point)]) -> Option<[[f32; 2]; 4]> {
-    let pts = prepare_points(points_slice)?;
-    let lfps = compute_lfps(&pts);
-
-    let errs = compute_corner_response(&pts, &lfps)?;
-    let maxima = detect_corner_candidates(&errs);
-
-    let quad = select_best_quad(&lfps, pts.len(), &maxima)?;
-    intersect_quad_lines(&lfps, pts.len(), quad)
+/// A persistent workspace that prevents heap allocations during quad fitting.
+#[derive(Default)]
+pub struct QuadWorkspace {
+    pub pts: Vec<FitPoint>,
+    pub lfps: Vec<LineFitPt>,
+    // lfps arrays
+    pub w_x: Vec<f64>,
+    pub w_y: Vec<f64>,
+    pub w_xx: Vec<f64>,
+    pub w_yy: Vec<f64>,
+    pub w_xy: Vec<f64>,
+    pub weights: Vec<f64>,
+    // corner response arrays
+    pub errs: Vec<f64>,
+    pub y_errs: Vec<f64>,
+    pub f: Vec<f64>,
+    // candidate arrays
+    pub maxima: Vec<usize>,
+    pub maxima_errs: Vec<f64>,
+    pub indices: Vec<usize>,
 }
 
-fn prepare_points(points: &[(u64, Point)]) -> Option<Vec<FitPoint>> {
-    if points.len() < MIN_CLUSTER_PIXELS {
+/// Fits a quadrilateral to a point cloud cluster representing a tag boundary.
+pub fn find_quad_corners(
+    workspace: &mut QuadWorkspace,
+    points_slice: &[(u64, Point)],
+) -> Option<[[f32; 2]; 4]> {
+    if !prepare_points(workspace, points_slice) {
         return None;
+    }
+
+    compute_lfps(workspace);
+
+    if !compute_corner_response(workspace) {
+        return None;
+    }
+
+    detect_corner_candidates(workspace);
+
+    let quad = select_best_quad(workspace)?;
+    intersect_quad_lines(&workspace.lfps, workspace.pts.len(), quad)
+}
+
+fn prepare_points(ws: &mut QuadWorkspace, points: &[(u64, Point)]) -> bool {
+    if points.len() < MIN_CLUSTER_PIXELS {
+        return false;
     }
 
     // Access the Point struct using .1 from the tuple
@@ -89,54 +119,53 @@ fn prepare_points(points: &[(u64, Point)]) -> Option<Vec<FitPoint>> {
         || width > MAX_TAG_DIMENSION
         || height > MAX_TAG_DIMENSION
     {
-        return None;
+        return false;
     }
 
     if width > height * MAX_ASPECT_RATIO || height > width * MAX_ASPECT_RATIO {
-        return None;
+        return false;
     }
 
     let approx_perimeter = (width + height) * 2;
     if points.len() < (approx_perimeter / MIN_DENSITY_DIVISOR) as usize {
-        return None;
+        return false;
     }
 
     let cx = (f64::from(xmin) + f64::from(xmax)).mul_add(0.5, CENTER_X_OFFSET);
     let cy = (f64::from(ymin) + f64::from(ymax)).mul_add(0.5, CENTER_Y_OFFSET);
 
-    let mut pts: Vec<FitPoint> = points
-        .iter()
-        .map(|(_, p)| FitPoint {
-            x: f64::from(p.x),
-            y: f64::from(p.y),
-            gx: f64::from(p.gx),
-            gy: f64::from(p.gy),
-            slope: 0.0,
-        })
-        .collect();
+    ws.pts.clear();
+    ws.pts.extend(points.iter().map(|(_, p)| FitPoint {
+        x: f64::from(p.x),
+        y: f64::from(p.y),
+        gx: f64::from(p.gx),
+        gy: f64::from(p.gy),
+        slope: 0.0,
+    }));
 
-    for p in &mut pts {
+    for p in &mut ws.pts {
         let dx = p.x - cx;
         let dy = p.y - cy;
         p.slope = dy.atan2(dx);
     }
 
-    pts.sort_unstable_by(|a, b| a.slope.partial_cmp(&b.slope).unwrap());
+    ws.pts
+        .sort_unstable_by(|a, b| a.slope.partial_cmp(&b.slope).unwrap());
 
-    Some(pts)
+    true
 }
 
-fn compute_corner_response(pts: &[FitPoint], lfps: &[LineFitPt]) -> Option<Vec<f64>> {
-    let sz = pts.len();
+fn compute_corner_response(ws: &mut QuadWorkspace) -> bool {
+    let sz = ws.pts.len();
     let ksz = 20.min(sz / 12);
     if ksz < 2 {
-        return None;
+        return false;
     }
 
-    let mut errs = vec![0.0; sz];
-    for (i, err_slot) in errs.iter_mut().enumerate().take(sz) {
-        let (_, _, _, _, err, _) = fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz);
-        *err_slot = err;
+    ws.errs.clear();
+    for i in 0..sz {
+        let (_, _, _, _, err, _) = fit_line(&ws.lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz);
+        ws.errs.push(err);
     }
 
     let sigma = 1.0_f64;
@@ -144,80 +173,83 @@ fn compute_corner_response(pts: &[FitPoint], lfps: &[LineFitPt]) -> Option<Vec<f
     let mut fsz = (-cutoff.ln() * 2.0 * sigma * sigma).sqrt() as i32 + 1;
     fsz = 2 * fsz + 1;
 
-    let mut f = Vec::with_capacity(fsz as usize);
+    ws.f.clear();
     for i in 0..fsz {
         let j = f64::from(i - fsz / 2);
-        f.push((-j * j / (2.0 * sigma * sigma)).exp());
+        ws.f.push((-j * j / (2.0 * sigma * sigma)).exp());
     }
 
-    let mut y_errs = vec![0.0; sz];
-
-    for (iy, y_err) in y_errs.iter_mut().enumerate().take(sz) {
+    ws.y_errs.clear();
+    for iy in 0..sz {
         let mut acc = 0.0;
 
         for i in 0..fsz {
             let idx = (iy as i32 + i - fsz / 2 + sz as i32) % (sz as i32);
-            acc = errs[idx as usize].mul_add(f[i as usize], acc);
+            acc = ws.errs[idx as usize].mul_add(ws.f[i as usize], acc);
         }
 
-        *y_err = acc;
+        ws.y_errs.push(acc);
     }
 
-    Some(y_errs)
+    true
 }
 
-fn detect_corner_candidates(errs: &[f64]) -> Vec<usize> {
-    let sz = errs.len();
-    let mut maxima = Vec::new();
-    let mut maxima_errs = Vec::new();
+fn detect_corner_candidates(ws: &mut QuadWorkspace) {
+    let sz = ws.y_errs.len();
+    ws.maxima.clear();
+    ws.maxima_errs.clear();
 
     for i in 0..sz {
-        if errs[i] > errs[(i + 1) % sz] && errs[i] > errs[(i + sz - 1) % sz] {
-            maxima.push(i);
-            maxima_errs.push(errs[i]);
+        if ws.y_errs[i] > ws.y_errs[(i + 1) % sz] && ws.y_errs[i] > ws.y_errs[(i + sz - 1) % sz] {
+            ws.maxima.push(i);
+            ws.maxima_errs.push(ws.y_errs[i]);
         }
     }
 
     let max_nmaxima = 10;
-    if maxima.len() > max_nmaxima {
-        let mut indices: Vec<usize> = (0..maxima.len()).collect();
-        indices.sort_unstable_by(|&a, &b| maxima_errs[b].partial_cmp(&maxima_errs[a]).unwrap());
-        let threshold = maxima_errs[indices[max_nmaxima]];
+    if ws.maxima.len() > max_nmaxima {
+        ws.indices.clear();
+        ws.indices.extend(0..ws.maxima.len());
+        ws.indices
+            .sort_unstable_by(|&a, &b| ws.maxima_errs[b].partial_cmp(&ws.maxima_errs[a]).unwrap());
 
-        maxima = maxima
-            .into_iter()
-            .zip(maxima_errs)
-            .filter(|(_, err)| *err > threshold)
-            .map(|(idx, _)| idx)
-            .collect();
+        let threshold = ws.maxima_errs[ws.indices[max_nmaxima]];
+
+        let mut keep_idx = 0;
+        for i in 0..ws.maxima.len() {
+            if ws.maxima_errs[i] > threshold {
+                ws.maxima[keep_idx] = ws.maxima[i];
+                keep_idx += 1;
+            }
+        }
+        ws.maxima.truncate(keep_idx);
     }
-
-    maxima
 }
 
-fn select_best_quad(lfps: &[LineFitPt], sz: usize, maxima: &[usize]) -> Option<[usize; 4]> {
-    if maxima.len() < 4 {
+fn select_best_quad(ws: &QuadWorkspace) -> Option<[usize; 4]> {
+    if ws.maxima.len() < 4 {
         return None;
     }
 
-    let nmaxima = maxima.len();
+    let sz = ws.pts.len();
+    let nmaxima = ws.maxima.len();
     let mut best_indices = [0; 4];
     let mut best_error = f64::INFINITY;
     let max_dot = 25.0_f64.to_radians().cos();
     let max_line_fit_mse = 10.0_f64;
 
     for m0 in 0..(nmaxima.saturating_sub(3)) {
-        let i0 = maxima[m0];
+        let i0 = ws.maxima[m0];
         for m1 in (m0 + 1)..(nmaxima.saturating_sub(2)) {
-            let i1 = maxima[m1];
-            let (_, _, nx01, ny01, err01, mse01) = fit_line(lfps, sz, i0, i1);
+            let i1 = ws.maxima[m1];
+            let (_, _, nx01, ny01, err01, mse01) = fit_line(&ws.lfps, sz, i0, i1);
             if mse01 > max_line_fit_mse {
                 continue;
             }
 
             for m2 in (m1 + 1)..(nmaxima.saturating_sub(1)) {
-                let i2 = maxima[m2];
-                let (_, _, nx12, ny12, err12, mse12) = fit_line(lfps, sz, i1, i2);
+                let i2 = ws.maxima[m2];
+                let (_, _, nx12, ny12, err12, mse12) = fit_line(&ws.lfps, sz, i1, i2);
                 if mse12 > max_line_fit_mse {
                     continue;
                 }
@@ -227,13 +259,13 @@ fn select_best_quad(lfps: &[LineFitPt], sz: usize, maxima: &[usize]) -> Option<[
                     continue;
                 }
 
-                for &i3 in maxima.iter().take(nmaxima).skip(m2 + 1) {
-                    let (_, _, _, _, err23, mse23) = fit_line(lfps, sz, i2, i3);
+                for &i3 in ws.maxima.iter().take(nmaxima).skip(m2 + 1) {
+                    let (_, _, _, _, err23, mse23) = fit_line(&ws.lfps, sz, i2, i3);
                     if mse23 > max_line_fit_mse {
                         continue;
                     }
 
-                    let (_, _, _, _, err30, mse30) = fit_line(lfps, sz, i3, i0);
+                    let (_, _, _, _, err30, mse30) = fit_line(&ws.lfps, sz, i3, i0);
                     if mse30 > max_line_fit_mse {
                         continue;
                     }
@@ -296,31 +328,30 @@ fn intersect_quad_lines(
     Some(exact_corners)
 }
 
-/// Precomputes cumulative moments. Equivalent to `compute_lfps` in C.
-/// Vectorization-friendly moment computation
-fn compute_lfps(pts: &[FitPoint]) -> Vec<LineFitPt> {
-    let len = pts.len();
-    let mut lfps = Vec::with_capacity(len);
+/// Precomputes cumulative moments directly into the workspace.
+fn compute_lfps(ws: &mut QuadWorkspace) {
+    let len = ws.pts.len();
 
-    let mut w_x = vec![0.0; len];
-    let mut w_y = vec![0.0; len];
-    let mut w_xx = vec![0.0; len];
-    let mut w_yy = vec![0.0; len];
-    let mut w_xy = vec![0.0; len];
-    let mut weights = vec![0.0; len];
+    ws.lfps.clear();
+    ws.w_x.clear();
+    ws.w_y.clear();
+    ws.w_xx.clear();
+    ws.w_yy.clear();
+    ws.w_xy.clear();
+    ws.weights.clear();
 
     for i in 0..len {
-        let p = &pts[i];
+        let p = &ws.pts[i];
         let x = p.x.mul_add(0.5, 0.5);
         let y = p.y.mul_add(0.5, 0.5);
         let w = (p.gx * p.gx + p.gy * p.gy).sqrt() + 1.0;
 
-        weights[i] = w;
-        w_x[i] = w * x;
-        w_y[i] = w * y;
-        w_xx[i] = w * x * x;
-        w_yy[i] = w * y * y;
-        w_xy[i] = w * x * y;
+        ws.weights.push(w);
+        ws.w_x.push(w * x);
+        ws.w_y.push(w * y);
+        ws.w_xx.push(w * x * x);
+        ws.w_yy.push(w * y * y);
+        ws.w_xy.push(w * x * y);
     }
 
     let mut sum_mx = 0.0;
@@ -331,14 +362,14 @@ fn compute_lfps(pts: &[FitPoint]) -> Vec<LineFitPt> {
     let mut sum_w = 0.0;
 
     for i in 0..len {
-        sum_mx += w_x[i];
-        sum_my += w_y[i];
-        sum_mxx += w_xx[i];
-        sum_myy += w_yy[i];
-        sum_mxy += w_xy[i];
-        sum_w += weights[i];
+        sum_mx += ws.w_x[i];
+        sum_my += ws.w_y[i];
+        sum_mxx += ws.w_xx[i];
+        sum_myy += ws.w_yy[i];
+        sum_mxy += ws.w_xy[i];
+        sum_w += ws.weights[i];
 
-        lfps.push(LineFitPt {
+        ws.lfps.push(LineFitPt {
             mx: sum_mx,
             my: sum_my,
             mxx: sum_mxx,
@@ -347,7 +378,6 @@ fn compute_lfps(pts: &[FitPoint]) -> Vec<LineFitPt> {
             w: sum_w,
         });
     }
-    lfps
 }
 
 /// Fits a line to points [i0, i1] (inclusive) using cumulative moments in O(1).

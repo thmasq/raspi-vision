@@ -10,7 +10,8 @@ mod apriltag;
 
 use crate::apriltag::{
     decode::{AprilTagDetection, QuickDecode, extract_detection},
-    quad::find_quad_corners,
+    quad::{QuadWorkspace, find_quad_corners},
+    threshold::AdaptiveThresholder,
 };
 use axum::{
     Json, Router,
@@ -248,6 +249,12 @@ fn capture_loop(
             }
         }
 
+        let mut quad_workspace = QuadWorkspace::default();
+        let mut thresholder = AdaptiveThresholder::new();
+        let mut valid_detections = Vec::with_capacity(32);
+        let mut filtered_detections = Vec::with_capacity(32);
+        let mut debug_frame_buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+
         let mut frames_processed = 0;
         let mut pipe_fps_timer = Instant::now();
 
@@ -279,7 +286,7 @@ fn capture_loop(
             let t_downsample = t_start.elapsed();
 
             let t_start = Instant::now();
-            unsafe { crate::apriltag::threshold::process(&mono_image, &mut threshold_img) };
+            unsafe { thresholder.process(&mono_image, &mut threshold_img) };
             let t_thresh = t_start.elapsed();
 
             let t_start = Instant::now();
@@ -296,32 +303,29 @@ fn capture_loop(
             );
             let t_cluster = t_start.elapsed();
 
-            let debug_frame = match current_controls.debug_view {
+            match current_controls.debug_view {
                 DebugView::Raw => {
-                    let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
                     if vga_stride == STREAM_WIDTH {
-                        buf.copy_from_slice(&raw_frame_vga[..STREAM_WIDTH * STREAM_HEIGHT]);
+                        debug_frame_buf
+                            .copy_from_slice(&raw_frame_vga[..STREAM_WIDTH * STREAM_HEIGHT]);
                     } else {
                         for y in 0..STREAM_HEIGHT {
                             let src_offset = y * vga_stride;
                             let dst_offset = y * STREAM_WIDTH;
-                            buf[dst_offset..dst_offset + STREAM_WIDTH].copy_from_slice(
+                            debug_frame_buf[dst_offset..dst_offset + STREAM_WIDTH].copy_from_slice(
                                 &raw_frame_vga[src_offset..src_offset + STREAM_WIDTH],
                             );
                         }
                     }
-                    buf
                 }
                 DebugView::Threshold => {
-                    let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
                     let thresh_slice = threshold_img.as_slice();
-                    for (dst, &src_idx) in buf.iter_mut().zip(&vga_lut_dense) {
+                    for (dst, &src_idx) in debug_frame_buf.iter_mut().zip(&vga_lut_dense) {
                         *dst = thresh_slice[src_idx];
                     }
-                    buf
                 }
                 DebugView::Segments => {
-                    let mut buf = vec![0u8; STREAM_WIDTH * STREAM_HEIGHT];
+                    debug_frame_buf.fill(0);
                     let scale_x = CAPTURE_WIDTH as f32 / STREAM_WIDTH as f32;
                     let scale_y = CAPTURE_HEIGHT as f32 / STREAM_HEIGHT as f32;
 
@@ -333,26 +337,31 @@ fn capture_loop(
                             let px = ((f32::from(pt.x) / 2.0) / scale_x) as usize;
                             let py = ((f32::from(pt.y) / 2.0) / scale_y) as usize;
                             let idx = py * STREAM_WIDTH + px;
-                            if idx < buf.len() {
-                                buf[idx] = 255;
+                            if idx < debug_frame_buf.len() {
+                                debug_frame_buf[idx] = 255;
                             }
                         }
                     }
-                    buf
                 }
             };
 
-            let _ = tx_video_pipe.send(debug_frame);
+            let _ = tx_video_pipe.send(debug_frame_buf.clone());
 
             let t_start = Instant::now();
-            let mut valid_detections: Vec<_> = clusters
-                .iter()
-                .filter_map(|cluster| {
-                    let points_slice = &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
-                    let corners = find_quad_corners(points_slice)?;
-                    extract_detection(&mono_image, &corners, &intrinsics, &quick_decode)
-                })
-                .collect();
+
+            valid_detections.clear();
+            filtered_detections.clear();
+
+            for cluster in &clusters {
+                let points_slice = &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
+                if let Some(corners) = find_quad_corners(&mut quad_workspace, points_slice) {
+                    if let Some(det) =
+                        extract_detection(&mono_image, &corners, &intrinsics, &quick_decode)
+                    {
+                        valid_detections.push(det);
+                    }
+                }
+            }
             let t_decode = t_start.elapsed();
 
             valid_detections.sort_unstable_by(|a, b| {
@@ -361,9 +370,7 @@ fn capture_loop(
                 conf_b.partial_cmp(&conf_a).unwrap()
             });
 
-            let mut filtered_detections = Vec::new();
-
-            for det in valid_detections {
+            for det in &valid_detections {
                 let is_duplicate = filtered_detections.iter().any(|kept: &AprilTagDetection| {
                     let dx = kept.center_x - det.center_x;
                     let dy = kept.center_y - det.center_y;
@@ -373,7 +380,7 @@ fn capture_loop(
                 });
 
                 if !is_duplicate {
-                    filtered_detections.push(det);
+                    filtered_detections.push(*det);
                 }
             }
 
@@ -383,7 +390,7 @@ fn capture_loop(
                 "Pipe: {total_pipe:?} | HW Downsample: {t_downsample:?}, Thresh: {t_thresh:?}, UF: {t_uf:?}, Cluster: {t_cluster:?}, Decode: {t_decode:?}"
             );
 
-            let top_detections: Vec<_> = filtered_detections.into_iter().take(10).collect();
+            let top_detections: Vec<_> = filtered_detections.iter().take(10).collect();
             if !top_detections.is_empty() {
                 println!(
                     "Found {} tag(s): {:?}",
