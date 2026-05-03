@@ -495,6 +495,11 @@ fn capture_loop(
     }
 }
 
+/// Initializes the shared memory file at `/dev/shm/tags.bin`.
+///
+/// # Errors
+///
+/// Returns an `std::io::Error` if the file cannot be opened, created, resized, or if the memory mapping fails.
 pub fn init_shm() -> std::io::Result<MmapMut> {
     let path = "/dev/shm/tags.bin";
 
@@ -502,6 +507,7 @@ pub fn init_shm() -> std::io::Result<MmapMut> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .open(path)?;
 
     let expected_size = std::mem::size_of::<SharedTags>() as u64;
@@ -517,7 +523,15 @@ pub fn init_shm() -> std::io::Result<MmapMut> {
 }
 
 pub fn write_tags_to_shm(mmap: &mut MmapMut, tags_in: &[AprilTagDetection], timestamp_us: u64) {
-    let ptr = mmap.as_mut_ptr().cast::<SharedTags>();
+    let raw_ptr = mmap.as_mut_ptr();
+
+    debug_assert!(
+        raw_ptr.align_offset(std::mem::align_of::<SharedTags>()) == 0,
+        "mmap pointer is not properly aligned"
+    );
+
+    #[allow(clippy::cast_ptr_alignment)]
+    let ptr = raw_ptr.cast::<SharedTags>();
 
     unsafe {
         let seq_ref = &(*ptr).seq;
@@ -526,7 +540,7 @@ pub fn write_tags_to_shm(mmap: &mut MmapMut, tags_in: &[AprilTagDetection], time
         seq_ref.store(current_seq.wrapping_add(1), Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
 
-        let count = tags_in.len().min(20);
+        let count = tags_in.len().min(MAX_TAGS);
 
         std::ptr::addr_of_mut!((*ptr).tag_count).write(count as u32);
         std::ptr::addr_of_mut!((*ptr).timestamp_us).write(timestamp_us);
@@ -545,6 +559,7 @@ pub fn write_tags_to_shm(mmap: &mut MmapMut, tags_in: &[AprilTagDetection], time
     }
 }
 
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn capture_timestamp_us() -> u64 {
     let ticks: u64;
@@ -557,5 +572,5 @@ fn capture_timestamp_us() -> u64 {
             out(reg) freq,
         );
     }
-    ((ticks as u128 * 1_000_000) / freq as u128) as u64
+    ((u128::from(ticks) * 1_000_000) / u128::from(freq)) as u64
 }
