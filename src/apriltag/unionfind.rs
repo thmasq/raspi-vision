@@ -70,19 +70,20 @@ impl UnionFind {
     }
 
     /// Finds the representative (root) of the set containing `id`.
-    pub fn get_representative(&mut self, mut id: u32) -> u32 {
-        let mut idx = id as usize;
-
-        while self.parent[idx] != id {
-            let parent_id = self.parent[idx];
-            let grandparent_id = self.parent[parent_id as usize];
-
-            self.parent[idx] = grandparent_id;
-            id = grandparent_id;
-            idx = id as usize;
+    pub fn get_representative(&mut self, id: u32) -> u32 {
+        let mut root = id;
+        while self.parent[root as usize] != root {
+            root = self.parent[root as usize];
         }
 
-        id
+        let mut curr = id;
+        while curr != root {
+            let next = self.parent[curr as usize];
+            self.parent[curr as usize] = root;
+            curr = next;
+        }
+
+        root
     }
 
     /// Returns the number of elements in the set containing `id`.
