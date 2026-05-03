@@ -559,6 +559,7 @@ pub fn write_tags_to_shm(mmap: &mut MmapMut, tags_in: &[AprilTagDetection], time
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 #[allow(clippy::inline_always)]
 #[inline(always)]
 fn capture_timestamp_us() -> u64 {
@@ -573,4 +574,12 @@ fn capture_timestamp_us() -> u64 {
         );
     }
     ((u128::from(ticks) * 1_000_000) / u128::from(freq)) as u64
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn capture_timestamp_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
 }
