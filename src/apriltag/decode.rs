@@ -684,11 +684,17 @@ pub struct AprilTagDetection {
     pub center_x: f32,   // Center pixel X
     pub center_y: f32,   // Center pixel Y
 
-    // 3D Pose estimates (Requires a separate PnP solver step using Camera Intrinsics)
+    // 3D Translation Vector (tvec) from PnP Solver
+    pub tx: f32, // Translation X in camera frame (mm, lateral)
+    pub ty: f32, // Translation Y in camera frame (mm, vertical)
+    pub tz: f32, // Translation Z in camera frame (mm, depth/forward)
+
+    // 3D Rotation (Euler angles derived from rvec)
     pub yaw: f32,
     pub pitch: f32,
     pub roll: f32,
-    pub distance_mm: f32,
+
+    pub distance_mm: f32, // Euclidean distance: sqrt(tx^2 + ty^2 + tz^2)
 }
 
 pub struct Homography {
@@ -857,6 +863,9 @@ pub fn extract_detection(
         confidence,
         center_x,
         center_y,
+        tx: pose.t.x,
+        ty: pose.t.y,
+        tz: pose.t.z,
         yaw: pose.yaw,
         pitch: pose.pitch,
         roll: pose.roll,
