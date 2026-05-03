@@ -31,6 +31,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 
+use memmap2::{MmapMut, MmapOptions};
+use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+const MAX_TAGS: usize = 20;
+
 // --- CAPTURE SETTINGS ---
 const CAPTURE_WIDTH: usize = 1296;
 const CAPTURE_HEIGHT: usize = 972;
@@ -53,6 +59,17 @@ struct CameraControls {
     exposure_time: i32,
     analogue_gain: f32,
     debug_view: DebugView,
+}
+
+#[repr(C)]
+pub struct SharedTags {
+    pub seq: AtomicU32,                      // offset 0
+    pub tag_count: u32,                      // offset 4
+    pub timestamp_us: u64,                   // offset 8
+    pub frame_w: f32,                        // offset 16
+    pub frame_h: f32,                        // offset 20
+    pub pad: u64,                            // offset 24 (aligns next field to 32)
+    pub tags: [AprilTagDetection; MAX_TAGS], // offset 32
 }
 
 struct AppState {
@@ -218,7 +235,15 @@ fn capture_loop(
         "Starting dual-stream capture loop: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} and {STREAM_WIDTH}x{STREAM_HEIGHT}..."
     );
 
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Vec<u8>)>(1);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Vec<u8>, u64)>(1);
+    let (shm_tx, shm_rx) = std::sync::mpsc::sync_channel::<(Vec<AprilTagDetection>, u64)>(2);
+
+    std::thread::spawn(move || {
+        let mut mmap = init_shm().expect("Failed to initialize SHM");
+        for (tags, timestamp) in shm_rx {
+            write_tags_to_shm(&mut mmap, &tags, timestamp);
+        }
+    });
 
     let tx_video_pipe = tx_video.clone();
     let tx_tags_pipe = tx_tags.clone();
@@ -258,7 +283,7 @@ fn capture_loop(
         let mut frames_processed = 0;
         let mut pipe_fps_timer = Instant::now();
 
-        for (raw_frame_full, raw_frame_vga) in frame_rx {
+        for (raw_frame_full, raw_frame_vga, capture_ts) in frame_rx {
             frames_processed += 1;
             if pipe_fps_timer.elapsed() >= Duration::from_secs(1) {
                 println!("Pipeline FPS: {frames_processed}");
@@ -343,7 +368,7 @@ fn capture_loop(
                         }
                     }
                 }
-            };
+            }
 
             let _ = tx_video_pipe.send(debug_frame_buf.clone());
 
@@ -354,12 +379,11 @@ fn capture_loop(
 
             for cluster in &clusters {
                 let points_slice = &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
-                if let Some(corners) = find_quad_corners(&mut quad_workspace, points_slice) {
-                    if let Some(det) =
+                if let Some(corners) = find_quad_corners(&mut quad_workspace, points_slice)
+                    && let Some(det) =
                         extract_detection(&mono_image, &corners, &intrinsics, &quick_decode)
-                    {
-                        valid_detections.push(det);
-                    }
+                {
+                    valid_detections.push(det);
                 }
             }
             let t_decode = t_start.elapsed();
@@ -383,6 +407,8 @@ fn capture_loop(
                     filtered_detections.push(*det);
                 }
             }
+
+            let _ = shm_tx.try_send((filtered_detections.clone(), capture_ts));
 
             let total_pipe = pipe_start.elapsed();
 
@@ -410,6 +436,8 @@ fn capture_loop(
     loop {
         let mut req = cam_rx.recv().unwrap();
 
+        let capture_ts = capture_timestamp_us();
+
         let buffer_full: &MemoryMappedFrameBuffer<FrameBuffer> =
             req.buffer(&stream_full).expect("Failed to get full buffer");
         let planes_data_full = buffer_full.data();
@@ -434,7 +462,7 @@ fn capture_loop(
         let frame_copy_full = raw_data_full.to_vec();
         let frame_copy_vga = raw_data_vga.to_vec();
 
-        match frame_tx.try_send((frame_copy_full, frame_copy_vga)) {
+        match frame_tx.try_send((frame_copy_full, frame_copy_vga, capture_ts)) {
             Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 eprintln!("Pipeline thread panicked or disconnected!");
@@ -465,4 +493,69 @@ fn capture_loop(
 
         camera.queue_request(req).unwrap();
     }
+}
+
+pub fn init_shm() -> std::io::Result<MmapMut> {
+    let path = "/dev/shm/tags.bin";
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)?;
+
+    let expected_size = std::mem::size_of::<SharedTags>() as u64;
+    file.set_len(expected_size)?;
+
+    let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+
+    unsafe {
+        std::ptr::write_bytes(mmap.as_mut_ptr(), 0, expected_size as usize);
+    }
+
+    Ok(mmap)
+}
+
+pub fn write_tags_to_shm(mmap: &mut MmapMut, tags_in: &[AprilTagDetection], timestamp_us: u64) {
+    let ptr = mmap.as_mut_ptr().cast::<SharedTags>();
+
+    unsafe {
+        let seq_ref = &(*ptr).seq;
+        let current_seq = seq_ref.load(Ordering::Relaxed);
+
+        seq_ref.store(current_seq.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+
+        let count = tags_in.len().min(20);
+
+        std::ptr::addr_of_mut!((*ptr).tag_count).write(count as u32);
+        std::ptr::addr_of_mut!((*ptr).timestamp_us).write(timestamp_us);
+        std::ptr::addr_of_mut!((*ptr).frame_w).write(1296.0);
+        std::ptr::addr_of_mut!((*ptr).frame_h).write(972.0);
+
+        if count > 0 {
+            std::ptr::copy_nonoverlapping(
+                tags_in.as_ptr(),
+                std::ptr::addr_of_mut!((*ptr).tags).cast::<AprilTagDetection>(),
+                count,
+            );
+        }
+
+        seq_ref.store(current_seq.wrapping_add(2), Ordering::Release);
+    }
+}
+
+#[inline(always)]
+fn capture_timestamp_us() -> u64 {
+    let ticks: u64;
+    let freq: u64;
+    unsafe {
+        std::arch::asm!(
+            "mrs {}, cntvct_el0",
+            "mrs {}, cntfrq_el0",
+            out(reg) ticks,
+            out(reg) freq,
+        );
+    }
+    ((ticks as u128 * 1_000_000) / freq as u128) as u64
 }

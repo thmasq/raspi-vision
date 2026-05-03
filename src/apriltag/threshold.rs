@@ -23,7 +23,7 @@ impl Default for AdaptiveThresholder {
 }
 
 impl AdaptiveThresholder {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             tile_mins: Vec::new(),
             tile_maxs: Vec::new(),

@@ -20,7 +20,7 @@ pub struct Run {
     pub id: u32,
 }
 
-/// A Run-Length based Union-Find implementation tailored for AprilTag.
+/// A Run-Length based Union-Find implementation tailored for `AprilTag`.
 pub struct UnionFind {
     /// Parent node for each run element.
     pub parent: Vec<u32>,
@@ -166,7 +166,7 @@ impl UnionFind {
                 });
 
                 if y > 0 {
-                    let expand = if color == 255 { 1 } else { 0 };
+                    let expand = usize::from(color == 255);
                     let match_start = start_x.saturating_sub(expand) as u16;
                     let match_end = (end_x + expand).min(w - 1) as u16;
 
@@ -204,8 +204,8 @@ impl UnionFind {
         self.edge_buffer.clear();
         self.flatten();
 
-        let mut row_y_runs = std::mem::replace(&mut self.row_y_runs, Vec::new());
-        let mut row_y1_runs = std::mem::replace(&mut self.row_y1_runs, Vec::new());
+        let mut row_y_runs = std::mem::take(&mut self.row_y_runs);
+        let mut row_y1_runs = std::mem::take(&mut self.row_y1_runs);
 
         if row_y_runs.len() < w {
             row_y_runs.resize(w, u32::MAX);
@@ -227,7 +227,7 @@ impl UnionFind {
 
             let mut x = 1;
             while x < w - 1 {
-                if x + 8 <= w - 1 {
+                if x + 8 < w {
                     let chunk = u64::from_ne_bytes(row_im[x..x + 8].try_into().unwrap());
                     if chunk == BG_CHUNK {
                         x += 8;
