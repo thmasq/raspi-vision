@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
+libc = "0.2.186"
 libcamera = { version = "0.7.0", features = ["vendor_draft"] }
 memmap2 = "0.9.10"
 nalgebra = { version = "0.34.2", features = ["serde-serialize"] }

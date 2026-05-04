@@ -153,11 +153,29 @@ async fn update_controls(
     axum::http::StatusCode::OK
 }
 
+#[derive(Clone, Copy)]
+struct SemWrapper(*mut libc::sem_t);
+unsafe impl Send for SemWrapper {}
+
 fn capture_loop(
     tx_video: &broadcast::Sender<Vec<u8>>,
     tx_tags: &broadcast::Sender<String>,
     controls_rx: &watch::Receiver<CameraControls>,
 ) {
+    let sem_name = std::ffi::CString::new("/navd_vision_sem").expect("CString::new failed");
+    let sem_ptr = unsafe {
+        // O_CREAT: Create if it doesn't exist.
+        // 0o666: Read/write permissions.
+        // 0: Initial value (start locked).
+        let s = libc::sem_open(sem_name.as_ptr(), libc::O_CREAT, 0o666, 0);
+        if s == libc::SEM_FAILED {
+            panic!("Failed to open /navd_vision_sem POSIX semaphore");
+        }
+        s
+    };
+    let shared_sem_ptr = SemWrapper(sem_ptr);
+
+    // 2. Standard Camera Initialization
     let mgr = CameraManager::new().expect("Failed to initialize libcamera");
     let cameras = mgr.cameras();
     let cam = cameras.get(0).expect("No cameras found");
@@ -239,9 +257,17 @@ fn capture_loop(
     let (shm_tx, shm_rx) = std::sync::mpsc::sync_channel::<(Vec<AprilTagDetection>, u64)>(2);
 
     std::thread::spawn(move || {
+        let thread_safe_wrapper = shared_sem_ptr;
+
         let mut mmap = init_shm().expect("Failed to initialize SHM");
+        let sem_handle = thread_safe_wrapper.0;
+
         for (tags, timestamp) in shm_rx {
             write_tags_to_shm(&mut mmap, &tags, timestamp);
+
+            unsafe {
+                libc::sem_post(sem_handle);
+            }
         }
     });
 

@@ -942,6 +942,7 @@ name = "raspi-vision"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "libcamera",
  "memmap2",
  "nalgebra",
