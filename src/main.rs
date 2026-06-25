@@ -97,8 +97,16 @@ async fn main() {
     });
 
     let capture_controls_rx = controls_rx.clone();
-    tokio::task::spawn_blocking(move || {
+
+    let capture_handle = tokio::task::spawn_blocking(move || {
         capture_loop(&tx_video, &tx_tags, &capture_controls_rx);
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = capture_handle.await {
+            eprintln!("FATAL: Capture loop task panicked: {e:?}");
+            std::process::exit(1);
+        }
     });
 
     let app = Router::new()
@@ -434,7 +442,9 @@ fn capture_loop(
                 }
             }
 
-            let _ = shm_tx.try_send((filtered_detections.clone(), capture_ts));
+            if let Err(e) = shm_tx.try_send((filtered_detections.clone(), capture_ts)) {
+                eprintln!("CRITICAL: Failed to send to SHM thread (did it panic?): {e}");
+            }
 
             let total_pipe = pipe_start.elapsed();
 
