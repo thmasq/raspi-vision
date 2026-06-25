@@ -462,12 +462,13 @@ fn fit_line(lfps: &[LineFitPt], sz: usize, i0: usize, i1: usize) -> (f64, f64, f
 fn sample_pixel_bilinear(image: &Image, x: f32, y: f32) -> Option<f32> {
     let x0 = x.trunc() as i32;
     let y0 = y.trunc() as i32;
-    let x1 = x0 + 1;
-    let y1 = y0 + 1;
 
-    if x0 < 0 || y0 < 0 || x1 >= image.width as i32 || y1 >= image.height as i32 {
+    if x0 < 0 || x0 >= image.width as i32 - 1 || y0 < 0 || y0 >= image.height as i32 - 1 {
         return None;
     }
+
+    let x1 = x0 + 1;
+    let y1 = y0 + 1;
 
     let a = x.fract();
     let b = y.fract();

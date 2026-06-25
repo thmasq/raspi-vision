@@ -791,7 +791,7 @@ fn sample_pixel(image: &Image, px: f32, py: f32) -> Option<f32> {
     let ix = x.floor() as i32;
     let iy = y.floor() as i32;
 
-    if ix < 0 || ix + 1 >= image.width as i32 || iy < 0 || iy + 1 >= image.height as i32 {
+    if ix < 0 || ix >= image.width as i32 - 1 || iy < 0 || iy >= image.height as i32 - 1 {
         return None;
     }
 
