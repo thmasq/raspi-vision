@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
+jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 libc = "0.2.186"
 libcamera = { version = "0.7.0", features = ["vendor_draft"] }
 memmap2 = "0.9.10"

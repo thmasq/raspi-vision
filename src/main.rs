@@ -116,7 +116,7 @@ async fn main() {
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9080));
-    println!("Server running at http://{addr}");
+    println!("Axum Server running at http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -139,14 +139,26 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
 
     loop {
         tokio::select! {
-            Ok(frame_data) = rx_video.recv() => {
-                if socket.send(Message::Binary(frame_data.into())).await.is_err() {
-                    break;
+            result = rx_video.recv() => {
+                match result {
+                    Ok(frame) => {
+                        if socket.send(Message::Binary(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
                 }
             }
-            Ok(tags_json) = rx_tags.recv() => {
-                if socket.send(Message::Text(tags_json.into())).await.is_err() {
-                    break;
+            result = rx_tags.recv() => {
+                match result {
+                    Ok(tags_json) => {
+                        if socket.send(Message::Text(tags_json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
                 }
             }
         }
@@ -183,7 +195,6 @@ fn capture_loop(
     };
     let shared_sem_ptr = SemWrapper(sem_ptr);
 
-    // 2. Standard Camera Initialization
     let mgr = CameraManager::new().expect("Failed to initialize libcamera");
     let cameras = mgr.cameras();
     let cam = cameras.get(0).expect("No cameras found");
@@ -279,9 +290,28 @@ fn capture_loop(
         }
     });
 
-    let tx_video_pipe = tx_video.clone();
     let tx_tags_pipe = tx_tags.clone();
     let controls_rx_pipe = controls_rx.clone();
+
+    let (encode_tx, encode_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+    let tx_video_pipe_encoder = tx_video.clone();
+
+    std::thread::spawn(move || {
+        for frame in encode_rx {
+            let mut jpeg_data = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT / 4);
+            let encoder = jpeg_encoder::Encoder::new(&mut jpeg_data, 60);
+            if let Err(e) = encoder.encode(
+                &frame,
+                STREAM_WIDTH as u16,
+                STREAM_HEIGHT as u16,
+                jpeg_encoder::ColorType::Luma,
+            ) {
+                eprintln!("JPEG encode failed: {:?}", e);
+            } else {
+                let _ = tx_video_pipe_encoder.send(jpeg_data);
+            }
+        }
+    });
 
     std::thread::spawn(move || {
         let mut global_uf = crate::apriltag::unionfind::UnionFind::new();
@@ -404,7 +434,13 @@ fn capture_loop(
                 }
             }
 
-            let _ = tx_video_pipe.send(debug_frame_buf.clone());
+            match encode_tx.try_send(debug_frame_buf.clone()) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    eprintln!("JPEG Encoder thread disconnected!");
+                }
+            }
 
             let t_start = Instant::now();
 
@@ -443,7 +479,7 @@ fn capture_loop(
             }
 
             if let Err(e) = shm_tx.try_send((filtered_detections.clone(), capture_ts)) {
-                eprintln!("CRITICAL: Failed to send to SHM thread (did it panic?): {e}");
+                eprintln!("CRITICAL: Failed to send to SHM thread: {e}");
             }
 
             let total_pipe = pipe_start.elapsed();
