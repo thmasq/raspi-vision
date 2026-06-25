@@ -320,11 +320,11 @@ fn capture_loop(
         let mut threshold_img =
             crate::apriltag::image::Image::new_simd_aligned(CAPTURE_WIDTH, CAPTURE_HEIGHT);
         let intrinsics = crate::apriltag::pose::CameraIntrinsics {
-            fx: 500.0,
-            fy: 500.0,
-            cx: 320.0,
-            cy: 240.0,
-            tag_size_mm: 165.0,
+            fx: 1223.8,
+            fy: 1223.8,
+            cx: 648.0,
+            cy: 486.0,
+            tag_size_mm: 100.0,
         };
 
         let quick_decode = QuickDecode::new();
