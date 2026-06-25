@@ -33,7 +33,7 @@ use tokio::sync::{broadcast, watch};
 
 use memmap2::{MmapMut, MmapOptions};
 use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const MAX_TAGS: usize = 20;
 
@@ -275,6 +275,9 @@ fn capture_loop(
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Vec<u8>, u64)>(1);
     let (shm_tx, shm_rx) = std::sync::mpsc::sync_channel::<(Vec<AprilTagDetection>, u64)>(2);
 
+    let pipeline_busy = Arc::new(AtomicBool::new(false));
+    let pipeline_busy_pipe = pipeline_busy.clone();
+
     std::thread::spawn(move || {
         let thread_safe_wrapper = shared_sem_ptr;
 
@@ -385,11 +388,15 @@ fn capture_loop(
             let t_uf = t_start.elapsed();
 
             let t_start = Instant::now();
-            let clusters = global_uf.gradient_clusters(
+            let mut clusters = global_uf.gradient_clusters(
                 threshold_img.as_slice(),
                 CAPTURE_WIDTH,
                 CAPTURE_HEIGHT,
             );
+
+            clusters.sort_unstable_by_key(|c| std::cmp::Reverse(c.end_idx - c.start_idx));
+            clusters.truncate(150);
+
             let t_cluster = t_start.elapsed();
 
             match current_controls.debug_view {
@@ -499,6 +506,8 @@ fn capture_loop(
                     let _ = tx_tags_pipe.send(json);
                 }
             }
+
+            pipeline_busy_pipe.store(false, Ordering::Relaxed);
         }
     });
 
