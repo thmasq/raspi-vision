@@ -34,6 +34,7 @@ use tokio::sync::{broadcast, watch};
 use memmap2::{MmapMut, MmapOptions};
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicU32, Ordering};
+use wtransport::{Endpoint, Identity, ServerConfig};
 
 const MAX_TAGS: usize = 20;
 
@@ -73,13 +74,27 @@ pub struct SharedTags {
 }
 
 struct AppState {
-    tx_video: broadcast::Sender<Vec<u8>>,
     tx_tags: broadcast::Sender<String>,
     controls_tx: watch::Sender<CameraControls>,
+    cert_hash: Vec<u8>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    let identity = Identity::self_signed(["localhost", "127.0.0.1", "raspberrypi.local"]).unwrap();
+    let cert = identity
+        .certificate_chain()
+        .as_slice()
+        .first()
+        .expect("Self-signed identity must have a certificate");
+
+    let cert_bytes = cert.der();
+
+    use sha2_soft::Digest;
+    let mut hasher = sha2_soft::Sha256::new();
+    hasher.update(cert_bytes);
+    let cert_hash = hasher.finalize().to_vec();
+
     let (tx_video, _) = broadcast::channel::<Vec<u8>>(16);
     let (tx_tags, _) = broadcast::channel::<String>(16);
 
@@ -91,9 +106,62 @@ async fn main() {
     });
 
     let app_state = Arc::new(AppState {
-        tx_video: tx_video.clone(),
         tx_tags: tx_tags.clone(),
         controls_tx,
+        cert_hash: cert_hash.clone(),
+    });
+
+    let wt_config = ServerConfig::builder()
+        .with_bind_default(9081)
+        .with_identity(identity)
+        .build();
+    let wt_endpoint = Endpoint::server(wt_config).unwrap();
+    let wt_tx_video = tx_video.clone();
+
+    tokio::spawn(async move {
+        println!("WebTransport Server running on port 9081");
+        loop {
+            let incoming = wt_endpoint.accept().await;
+            let wt_tx_video = wt_tx_video.clone();
+
+            tokio::spawn(async move {
+                match incoming.await {
+                    Ok(session_request) => match session_request.accept().await {
+                        Ok(connection) => {
+                            println!("WebTransport client connected!");
+                            let mut rx_video = wt_tx_video.subscribe();
+
+                            loop {
+                                match rx_video.recv().await {
+                                    Ok(frame_data) => match connection.open_uni().await {
+                                        Ok(opening_stream) => match opening_stream.await {
+                                            Ok(mut stream) => {
+                                                let _ = stream.write_all(&frame_data).await;
+                                                let _ = stream.finish().await;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Stream blocked by flow control: {:?}", e)
+                                            }
+                                        },
+                                        Err(e) => {
+                                            eprintln!("WebTransport stream error: {:?}", e);
+                                            break;
+                                        }
+                                    },
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            println!("WebTransport client disconnected!");
+                        }
+                        Err(e) => eprintln!("Failed to accept WebTransport session: {:?}", e),
+                    },
+                    Err(e) => eprintln!("WebTransport QUIC connection failed: {:?}", e),
+                }
+            });
+        }
     });
 
     let capture_controls_rx = controls_rx.clone();
@@ -111,12 +179,13 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index_html))
+        .route("/cert-hash", get(get_cert_hash))
         .route("/ws", get(websocket_handler))
         .route("/controls", post(update_controls))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9080));
-    println!("Server running at http://{addr}");
+    println!("Axum Server running at http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -124,6 +193,10 @@ async fn main() {
 
 async fn index_html() -> Html<&'static str> {
     Html(include_str!("../index.html"))
+}
+
+async fn get_cert_hash(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.cert_hash.clone()
 }
 
 async fn websocket_handler(
@@ -134,21 +207,16 @@ async fn websocket_handler(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    let mut rx_video = state.tx_video.subscribe();
     let mut rx_tags = state.tx_tags.subscribe();
-
     loop {
-        tokio::select! {
-            Ok(frame_data) = rx_video.recv() => {
-                if socket.send(Message::Binary(frame_data.into())).await.is_err() {
-                    break;
-                }
-            }
-            Ok(tags_json) = rx_tags.recv() => {
+        match rx_tags.recv().await {
+            Ok(tags_json) => {
                 if socket.send(Message::Text(tags_json.into())).await.is_err() {
                     break;
                 }
             }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(_) => break,
         }
     }
 }
@@ -183,7 +251,6 @@ fn capture_loop(
     };
     let shared_sem_ptr = SemWrapper(sem_ptr);
 
-    // 2. Standard Camera Initialization
     let mgr = CameraManager::new().expect("Failed to initialize libcamera");
     let cameras = mgr.cameras();
     let cam = cameras.get(0).expect("No cameras found");
@@ -279,9 +346,28 @@ fn capture_loop(
         }
     });
 
-    let tx_video_pipe = tx_video.clone();
     let tx_tags_pipe = tx_tags.clone();
     let controls_rx_pipe = controls_rx.clone();
+
+    let (encode_tx, encode_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+    let tx_video_pipe_encoder = tx_video.clone();
+
+    std::thread::spawn(move || {
+        for frame in encode_rx {
+            let mut jpeg_data = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT / 4);
+            let encoder = jpeg_encoder::Encoder::new(&mut jpeg_data, 60);
+            if let Err(e) = encoder.encode(
+                &frame,
+                STREAM_WIDTH as u16,
+                STREAM_HEIGHT as u16,
+                jpeg_encoder::ColorType::Luma,
+            ) {
+                eprintln!("JPEG encode failed: {:?}", e);
+            } else {
+                let _ = tx_video_pipe_encoder.send(jpeg_data);
+            }
+        }
+    });
 
     std::thread::spawn(move || {
         let mut global_uf = crate::apriltag::unionfind::UnionFind::new();
@@ -404,7 +490,13 @@ fn capture_loop(
                 }
             }
 
-            let _ = tx_video_pipe.send(debug_frame_buf.clone());
+            match encode_tx.try_send(debug_frame_buf.clone()) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    eprintln!("JPEG Encoder thread disconnected!");
+                }
+            }
 
             let t_start = Instant::now();
 
@@ -443,7 +535,7 @@ fn capture_loop(
             }
 
             if let Err(e) = shm_tx.try_send((filtered_detections.clone(), capture_ts)) {
-                eprintln!("CRITICAL: Failed to send to SHM thread (did it panic?): {e}");
+                eprintln!("CRITICAL: Failed to send to SHM thread: {e}");
             }
 
             let total_pipe = pipe_start.elapsed();

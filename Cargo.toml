@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
+jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 libc = "0.2.186"
 libcamera = { version = "0.7.0", features = ["vendor_draft"] }
 memmap2 = "0.9.10"
@@ -15,8 +16,11 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.52.1", features = ["full"] }
 tower-http = { version = "0.6.8", features = ["fs", "cors"] }
+wtransport = { version = "0.7.1", default-features = false, features = ["aws-lc-rs", "self-signed"] }
+sha2_soft = { package = "sha2", version = "0.10.8", features = ["force-soft"] }
 
 [profile.release]
 lto = "fat"
+debug = 1
 opt-level = 3
 codegen-units = 1
