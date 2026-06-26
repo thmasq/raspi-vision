@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 
+use bytes::Bytes;
 use memmap2::{MmapMut, MmapOptions};
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -73,14 +74,14 @@ pub struct SharedTags {
 }
 
 struct AppState {
-    tx_video: broadcast::Sender<Vec<u8>>,
+    tx_video: broadcast::Sender<Bytes>,
     tx_tags: broadcast::Sender<String>,
     controls_tx: watch::Sender<CameraControls>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let (tx_video, _) = broadcast::channel::<Vec<u8>>(16);
+    let (tx_video, _) = broadcast::channel::<Bytes>(16);
     let (tx_tags, _) = broadcast::channel::<String>(16);
 
     let (controls_tx, controls_rx) = watch::channel(CameraControls {
@@ -178,7 +179,7 @@ struct SemWrapper(*mut libc::sem_t);
 unsafe impl Send for SemWrapper {}
 
 fn capture_loop(
-    tx_video: &broadcast::Sender<Vec<u8>>,
+    tx_video: &broadcast::Sender<Bytes>,
     tx_tags: &broadcast::Sender<String>,
     controls_rx: &watch::Receiver<CameraControls>,
 ) {
@@ -273,6 +274,7 @@ fn capture_loop(
     );
 
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Vec<u8>, u64)>(1);
+    let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<(Vec<u8>, Vec<u8>)>();
     let (shm_tx, shm_rx) = std::sync::mpsc::sync_channel::<(Vec<AprilTagDetection>, u64)>(2);
 
     let pipeline_busy = Arc::new(AtomicBool::new(false));
@@ -315,12 +317,14 @@ fn capture_loop(
             ) {
                 eprintln!("JPEG encode failed: {:?}", e);
             } else {
-                let _ = tx_video_pipe_encoder.send(jpeg_data);
+                let _ = tx_video_pipe_encoder.send(Bytes::from(jpeg_data));
             }
         }
     });
 
     let tx_video_pipeline = tx_video.clone();
+
+    let recycle_tx_pipe = recycle_tx.clone();
 
     std::thread::spawn(move || {
         let mut global_uf = crate::apriltag::unionfind::UnionFind::new();
@@ -394,14 +398,13 @@ fn capture_loop(
             let t_uf = t_start.elapsed();
 
             let t_start = Instant::now();
-            let mut clusters = global_uf.gradient_clusters(
-                threshold_img.as_slice(),
-                CAPTURE_WIDTH,
-                CAPTURE_HEIGHT,
-            );
 
-            clusters.sort_unstable_by_key(|c| std::cmp::Reverse(c.end_idx - c.start_idx));
-            clusters.truncate(150);
+            global_uf.gradient_clusters(threshold_img.as_slice(), CAPTURE_WIDTH, CAPTURE_HEIGHT);
+
+            global_uf
+                .clusters
+                .sort_unstable_by_key(|c| std::cmp::Reverse(c.end_idx - c.start_idx));
+            global_uf.clusters.truncate(150);
 
             let t_cluster = t_start.elapsed();
 
@@ -433,7 +436,7 @@ fn capture_loop(
                         let scale_x = CAPTURE_WIDTH as f32 / STREAM_WIDTH as f32;
                         let scale_y = CAPTURE_HEIGHT as f32 / STREAM_HEIGHT as f32;
 
-                        for cluster in &clusters {
+                        for cluster in &global_uf.clusters {
                             let points_slice =
                                 &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
 
@@ -463,7 +466,7 @@ fn capture_loop(
             valid_detections.clear();
             filtered_detections.clear();
 
-            for cluster in &clusters {
+            for cluster in &global_uf.clusters {
                 let points_slice = &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
                 if let Some(corners) = find_quad_corners(&mut quad_workspace, points_slice)
                     && let Some(det) =
@@ -517,6 +520,7 @@ fn capture_loop(
             }
 
             pipeline_busy_pipe.store(false, Ordering::Relaxed);
+            let _ = recycle_tx_pipe.send((raw_frame_full, raw_frame_vga));
         }
     });
 
@@ -549,11 +553,25 @@ fn capture_loop(
             fps_timer = Instant::now();
         }
 
-        let frame_copy_full = raw_data_full.to_vec();
-        let frame_copy_vga = raw_data_vga.to_vec();
+        let (mut frame_copy_full, mut frame_copy_vga) =
+            recycle_rx.try_recv().unwrap_or_else(|_| {
+                (
+                    Vec::with_capacity(raw_data_full.len()),
+                    Vec::with_capacity(raw_data_vga.len()),
+                )
+            });
+
+        frame_copy_full.clear();
+        frame_copy_full.extend_from_slice(raw_data_full);
+
+        frame_copy_vga.clear();
+        frame_copy_vga.extend_from_slice(raw_data_vga);
 
         match frame_tx.try_send((frame_copy_full, frame_copy_vga, capture_ts)) {
-            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full((dropped_full, dropped_vga, _))) => {
+                let _ = recycle_tx.send((dropped_full, dropped_vga));
+            }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 eprintln!("Pipeline thread panicked or disconnected!");
                 break;

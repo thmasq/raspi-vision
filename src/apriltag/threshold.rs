@@ -305,9 +305,15 @@ impl AdaptiveThresholder {
 
         let tiles_x = input.width / TILE_SIZE;
         let tiles_y = input.height / TILE_SIZE;
+        let total_tiles = tiles_x * tiles_y;
 
-        let mut tile_mins = vec![255u8; tiles_x * tiles_y];
-        let mut tile_maxs = vec![0u8; tiles_x * tiles_y];
+        self.tile_mins.clear();
+        self.tile_mins.resize(total_tiles, 255u8);
+        self.tile_maxs.clear();
+        self.tile_maxs.resize(total_tiles, 0u8);
+
+        let tile_mins = &mut self.tile_mins;
+        let tile_maxs = &mut self.tile_maxs;
 
         // =========================================================================
         // PHASE 1: Localized Min/Max Extraction

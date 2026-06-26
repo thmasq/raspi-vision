@@ -36,6 +36,8 @@ pub struct UnionFind {
     pub row_y_runs: Vec<u32>,
     /// A persistent buffer for the next row's run IDs, used in conjunction with `row_y_runs` for row-by-row scanning.
     pub row_y1_runs: Vec<u32>,
+    /// A persistent buffer for detected clusters.
+    pub clusters: Vec<Cluster>,
 }
 
 impl UnionFind {
@@ -49,6 +51,7 @@ impl UnionFind {
             edge_buffer: Vec::with_capacity(250_000),
             row_y_runs: vec![u32::MAX; 1296],
             row_y1_runs: vec![u32::MAX; 1296],
+            clusters: Vec::with_capacity(1000),
         }
     }
 
@@ -67,6 +70,7 @@ impl UnionFind {
         self.runs.clear();
         self.row_starts.clear();
         self.edge_buffer.clear();
+        self.clusters.clear();
     }
 
     /// Finds the representative (root) of the set containing `id`.
@@ -201,7 +205,7 @@ impl UnionFind {
     }
 
     /// Extract boundary clusters (gradient boundary points)
-    pub fn gradient_clusters(&mut self, im: &[u8], w: usize, h: usize) -> Vec<Cluster> {
+    pub fn gradient_clusters(&mut self, im: &[u8], w: usize, h: usize) {
         self.edge_buffer.clear();
         self.flatten();
 
@@ -324,7 +328,7 @@ impl UnionFind {
 
         radsort::sort_by_key(&mut self.edge_buffer, |&(id, _)| id);
 
-        let mut clusters = Vec::new();
+        self.clusters.clear();
         let mut chunk_start = 0;
 
         while chunk_start < self.edge_buffer.len() {
@@ -337,7 +341,7 @@ impl UnionFind {
             }
 
             if chunk_end - chunk_start >= 24 {
-                clusters.push(Cluster {
+                self.clusters.push(Cluster {
                     start_idx: chunk_start,
                     end_idx: chunk_end,
                 });
@@ -345,7 +349,5 @@ impl UnionFind {
 
             chunk_start = chunk_end;
         }
-
-        clusters
     }
 }

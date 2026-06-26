@@ -1,4 +1,5 @@
 use crate::apriltag::decode::Homography;
+use arrayvec::ArrayVec;
 use nalgebra::{Matrix3, Vector3};
 use serde::Serialize;
 
@@ -65,7 +66,7 @@ fn polyval(p: &[f32], x: f32) -> f32 {
 }
 
 /// Numerically solve small degree polynomials using Newton's Method + Bisection.
-fn solve_poly_approx(p: &[f32], roots: &mut Vec<f32>) {
+fn solve_poly_approx(p: &[f32], roots: &mut ArrayVec<f32, 5>) {
     const MAX_ROOT: f32 = 1000.0;
     let degree = p.len() - 1;
 
@@ -76,12 +77,12 @@ fn solve_poly_approx(p: &[f32], roots: &mut Vec<f32>) {
         return;
     }
 
-    let mut p_der = Vec::with_capacity(degree);
+    let mut p_der: ArrayVec<f32, 5> = ArrayVec::new();
     for i in 0..degree {
         p_der.push((i + 1) as f32 * p[i + 1]);
     }
 
-    let mut der_roots = Vec::new();
+    let mut der_roots: ArrayVec<f32, 5> = ArrayVec::new();
     solve_poly_approx(&p_der, &mut der_roots);
 
     for i in 0..=der_roots.len() {
@@ -335,7 +336,7 @@ pub fn fix_pose_ambiguities(
     let coeffs = compute_error_coeffs(&data, &align.r_gamma);
     let poly = derive_polynomial(&coeffs);
 
-    let mut roots = Vec::with_capacity(4);
+    let mut roots: ArrayVec<f32, 5> = ArrayVec::new();
     solve_poly_approx(&poly, &mut roots);
 
     let alt_min_t = find_alternative_minimum(&roots, &coeffs, align.t_initial)?;
@@ -478,7 +479,7 @@ fn derive_polynomial(c: &ErrorCoeffs) -> [f32; 5] {
 
 /// Evaluates the roots to ensure they represent a valid secondary minimum that is distinct from the initial pose.
 fn find_alternative_minimum(roots: &[f32], c: &ErrorCoeffs, t_initial: f32) -> Option<f32> {
-    let mut minima = Vec::with_capacity(4);
+    let mut minima: ArrayVec<f32, 5> = ArrayVec::new();
 
     for &t1 in roots {
         let t2 = t1 * t1;
