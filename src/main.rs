@@ -301,6 +301,10 @@ fn capture_loop(
 
     std::thread::spawn(move || {
         for frame in encode_rx {
+            if tx_video_pipe_encoder.receiver_count() == 0 {
+                continue;
+            }
+
             let mut jpeg_data = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT / 4);
             let encoder = jpeg_encoder::Encoder::new(&mut jpeg_data, 60);
             if let Err(e) = encoder.encode(
@@ -315,6 +319,8 @@ fn capture_loop(
             }
         }
     });
+
+    let tx_video_pipeline = tx_video.clone();
 
     std::thread::spawn(move || {
         let mut global_uf = crate::apriltag::unionfind::UnionFind::new();
@@ -399,53 +405,56 @@ fn capture_loop(
 
             let t_cluster = t_start.elapsed();
 
-            match current_controls.debug_view {
-                DebugView::Raw => {
-                    if vga_stride == STREAM_WIDTH {
-                        debug_frame_buf
-                            .copy_from_slice(&raw_frame_vga[..STREAM_WIDTH * STREAM_HEIGHT]);
-                    } else {
-                        for y in 0..STREAM_HEIGHT {
-                            let src_offset = y * vga_stride;
-                            let dst_offset = y * STREAM_WIDTH;
-                            debug_frame_buf[dst_offset..dst_offset + STREAM_WIDTH].copy_from_slice(
-                                &raw_frame_vga[src_offset..src_offset + STREAM_WIDTH],
-                            );
+            if tx_video_pipeline.receiver_count() > 0 {
+                match current_controls.debug_view {
+                    DebugView::Raw => {
+                        if vga_stride == STREAM_WIDTH {
+                            debug_frame_buf
+                                .copy_from_slice(&raw_frame_vga[..STREAM_WIDTH * STREAM_HEIGHT]);
+                        } else {
+                            for y in 0..STREAM_HEIGHT {
+                                let src_offset = y * vga_stride;
+                                let dst_offset = y * STREAM_WIDTH;
+                                debug_frame_buf[dst_offset..dst_offset + STREAM_WIDTH]
+                                    .copy_from_slice(
+                                        &raw_frame_vga[src_offset..src_offset + STREAM_WIDTH],
+                                    );
+                            }
                         }
                     }
-                }
-                DebugView::Threshold => {
-                    let thresh_slice = threshold_img.as_slice();
-                    for (dst, &src_idx) in debug_frame_buf.iter_mut().zip(&vga_lut_dense) {
-                        *dst = thresh_slice[src_idx];
+                    DebugView::Threshold => {
+                        let thresh_slice = threshold_img.as_slice();
+                        for (dst, &src_idx) in debug_frame_buf.iter_mut().zip(&vga_lut_dense) {
+                            *dst = thresh_slice[src_idx];
+                        }
                     }
-                }
-                DebugView::Segments => {
-                    debug_frame_buf.fill(0);
-                    let scale_x = CAPTURE_WIDTH as f32 / STREAM_WIDTH as f32;
-                    let scale_y = CAPTURE_HEIGHT as f32 / STREAM_HEIGHT as f32;
+                    DebugView::Segments => {
+                        debug_frame_buf.fill(0);
+                        let scale_x = CAPTURE_WIDTH as f32 / STREAM_WIDTH as f32;
+                        let scale_y = CAPTURE_HEIGHT as f32 / STREAM_HEIGHT as f32;
 
-                    for cluster in &clusters {
-                        let points_slice =
-                            &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
+                        for cluster in &clusters {
+                            let points_slice =
+                                &global_uf.edge_buffer[cluster.start_idx..cluster.end_idx];
 
-                        for &(_, pt) in points_slice {
-                            let px = ((f32::from(pt.x) / 2.0) / scale_x) as usize;
-                            let py = ((f32::from(pt.y) / 2.0) / scale_y) as usize;
-                            let idx = py * STREAM_WIDTH + px;
-                            if idx < debug_frame_buf.len() {
-                                debug_frame_buf[idx] = 255;
+                            for &(_, pt) in points_slice {
+                                let px = ((f32::from(pt.x) / 2.0) / scale_x) as usize;
+                                let py = ((f32::from(pt.y) / 2.0) / scale_y) as usize;
+                                let idx = py * STREAM_WIDTH + px;
+                                if idx < debug_frame_buf.len() {
+                                    debug_frame_buf[idx] = 255;
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            match encode_tx.try_send(debug_frame_buf.clone()) {
-                Ok(_) => {}
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    eprintln!("JPEG Encoder thread disconnected!");
+                match encode_tx.try_send(debug_frame_buf.clone()) {
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        eprintln!("JPEG Encoder thread disconnected!");
+                    }
                 }
             }
 
