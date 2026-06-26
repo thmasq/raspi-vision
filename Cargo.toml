@@ -11,9 +11,11 @@ arrayvec = "0.7.7"
 axum = { version = "0.8.9", features = ["ws"] }
 bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive"] }
+env_logger = "0.11.11"
 jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 libc = "0.2.186"
 libcamera = { version = "0.7.0", features = ["vendor_draft"] }
+log = "0.4.33"
 memmap2 = "0.9.10"
 nalgebra = { version = "0.34.2", features = ["serde-serialize"] }
 radsort = "0.1.1"

@@ -26,6 +26,7 @@ use clap::{Parser, ValueEnum};
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::{camera_manager::CameraManager, controls, formats};
+use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -102,6 +103,7 @@ struct AppState {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = CliArgs::parse();
 
     let (tx_video, _) = broadcast::channel::<Bytes>(16);
@@ -128,7 +130,7 @@ async fn main() {
 
     tokio::spawn(async move {
         if let Err(e) = capture_handle.await {
-            eprintln!("FATAL: Capture loop task panicked: {e:?}");
+            error!("FATAL: Capture loop task panicked: {e:?}");
             std::process::exit(1);
         }
     });
@@ -140,7 +142,7 @@ async fn main() {
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9080));
-    println!("Axum Server running at http://{addr}");
+    info!("Axum Server running at http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -158,6 +160,7 @@ async fn websocket_handler(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    info!("New WebSocket client connected");
     let mut rx_video = state.tx_video.subscribe();
     let mut rx_tags = state.tx_tags.subscribe();
 
@@ -167,10 +170,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 match result {
                     Ok(frame) => {
                         if socket.send(Message::Binary(frame.into())).await.is_err() {
+                            info!("WebSocket client disconnected (video send failed)");
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("WebSocket video channel lagging, skipped {} frames", skipped);
+                        continue;
+                    }
                     Err(_) => break,
                 }
             }
@@ -178,10 +185,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 match result {
                     Ok(tags_json) => {
                         if socket.send(Message::Text(tags_json.into())).await.is_err() {
+                            info!("WebSocket client disconnected (tags send failed)");
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("WebSocket tags channel lagging, skipped {} messages", skipped);
+                        continue;
+                    }
                     Err(_) => break,
                 }
             }
@@ -193,6 +204,7 @@ async fn update_controls(
     State(state): State<Arc<AppState>>,
     Json(controls): Json<CameraControls>,
 ) -> impl IntoResponse {
+    info!("Camera controls updated via API: {:?}", controls);
     let _ = state.controls_tx.send(controls);
     axum::http::StatusCode::OK
 }
@@ -221,7 +233,10 @@ fn capture_loop(
 
     let mgr = CameraManager::new().expect("Failed to initialize libcamera");
     let cameras = mgr.cameras();
+    info!("Initialized libcamera. Found {} camera(s).", cameras.len());
+
     let cam = cameras.get(0).expect("No cameras found");
+    info!("Acquired camera: {}", cam.id());
     let mut camera = cam.acquire().expect("Failed to acquire camera");
 
     let mut config = camera
@@ -292,7 +307,7 @@ fn capture_loop(
         cam_tx.send(req).unwrap();
     });
 
-    println!(
+    info!(
         "Starting dual-stream capture loop: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} and {STREAM_WIDTH}x{STREAM_HEIGHT}..."
     );
 
@@ -338,7 +353,7 @@ fn capture_loop(
                 STREAM_HEIGHT as u16,
                 jpeg_encoder::ColorType::Luma,
             ) {
-                eprintln!("JPEG encode failed: {:?}", e);
+                error!("JPEG encode failed: {:?}", e);
             } else {
                 let _ = tx_video_pipe_encoder.send(Bytes::from(jpeg_data));
             }
@@ -386,7 +401,7 @@ fn capture_loop(
         for (raw_frame_full, raw_frame_vga, capture_ts) in frame_rx {
             frames_processed += 1;
             if pipe_fps_timer.elapsed() >= Duration::from_secs(1) {
-                println!("Pipeline FPS: {frames_processed}");
+                debug!("Pipeline FPS: {frames_processed}");
                 frames_processed = 0;
                 pipe_fps_timer = Instant::now();
             }
@@ -477,9 +492,11 @@ fn capture_loop(
 
                 match encode_tx.try_send(debug_frame_buf.clone()) {
                     Ok(_) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        warn!("JPEG Encoder queue full, dropping debug frame!");
+                    }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        eprintln!("JPEG Encoder thread disconnected!");
+                        error!("JPEG Encoder thread disconnected!");
                     }
                 }
             }
@@ -521,18 +538,18 @@ fn capture_loop(
             }
 
             if let Err(e) = shm_tx.try_send((filtered_detections.clone(), capture_ts)) {
-                eprintln!("CRITICAL: Failed to send to SHM thread: {e}");
+                error!("CRITICAL: Failed to send to SHM thread: {e}");
             }
 
             let total_pipe = pipe_start.elapsed();
 
-            println!(
+            trace!(
                 "Pipe: {total_pipe:?} | HW Downsample: {t_downsample:?}, Thresh: {t_thresh:?}, UF: {t_uf:?}, Cluster: {t_cluster:?}, Decode: {t_decode:?}"
             );
 
             let top_detections: Vec<_> = filtered_detections.iter().take(10).collect();
             if !top_detections.is_empty() {
-                println!(
+                debug!(
                     "Found {} tag(s): {:?}",
                     top_detections.len(),
                     top_detections
@@ -577,7 +594,7 @@ fn capture_loop(
 
         frames_captured += 1;
         if fps_timer.elapsed() >= Duration::from_secs(1) {
-            println!("Capture FPS: {frames_captured}");
+            debug!("Capture FPS: {frames_captured}");
             frames_captured = 0;
             fps_timer = Instant::now();
         }
@@ -599,10 +616,11 @@ fn capture_loop(
         match frame_tx.try_send((frame_copy_full, frame_copy_vga, capture_ts)) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full((dropped_full, dropped_vga, _))) => {
+                warn!("Pipeline thread is busy, dropping camera frame!");
                 let _ = recycle_tx.send((dropped_full, dropped_vga));
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                eprintln!("Pipeline thread panicked or disconnected!");
+                error!("Pipeline thread panicked or disconnected!");
                 break;
             }
         }
@@ -639,6 +657,7 @@ fn capture_loop(
 /// Returns an `std::io::Error` if the file cannot be opened, created, resized, or if the memory mapping fails.
 pub fn init_shm() -> std::io::Result<MmapMut> {
     let path = "/dev/shm/tags.bin";
+    info!("Initializing shared memory at {}", path);
 
     let file = OpenOptions::new()
         .read(true)
