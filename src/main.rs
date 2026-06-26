@@ -530,6 +530,12 @@ fn capture_loop(
     loop {
         let mut req = cam_rx.recv().unwrap();
 
+        if req.status() != libcamera::request::RequestStatus::Complete {
+            req.reuse(libcamera::request::ReuseFlag::REUSE_BUFFERS);
+            camera.queue_request(req).unwrap();
+            continue;
+        }
+
         let capture_ts = capture_timestamp_us();
 
         let buffer_full: &MemoryMappedFrameBuffer<FrameBuffer> =
@@ -597,7 +603,7 @@ fn capture_loop(
         controls.set(controls::AwbEnable(false)).unwrap();
         controls.set(controls::Saturation(0.0)).unwrap();
         controls.set(controls::Sharpness(0.0)).unwrap();
-        controls.set(controls::NoiseReductionMode::Off).unwrap();
+        controls.set(controls::NoiseReductionMode::Fast).unwrap();
 
         camera.queue_request(req).unwrap();
     }
