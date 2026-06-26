@@ -2,11 +2,15 @@
 name = "raspi-vision"
 version = "0.1.0"
 edition = "2024"
+authors = ["Thomas <thmasqsa@gmail.com"]
+license = "GPL-3.0-only"
+description = "Lightweight apriltag detection for the Raspberry Pi"
 
 [dependencies]
 arrayvec = "0.7.7"
 axum = { version = "0.8.9", features = ["ws"] }
 bytes = "1.12.0"
+clap = { version = "4.6.1", features = ["derive"] }
 jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 libc = "0.2.186"
 libcamera = { version = "0.7.0", features = ["vendor_draft"] }

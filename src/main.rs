@@ -22,6 +22,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
+use clap::{Parser, ValueEnum};
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::{camera_manager::CameraManager, controls, formats};
@@ -47,7 +48,7 @@ const STREAM_WIDTH: usize = 640;
 const STREAM_HEIGHT: usize = 480;
 
 // --- CAMERA CONTROLS ---
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, ValueEnum)]
 pub enum DebugView {
     Raw,
     Threshold,
@@ -73,6 +74,26 @@ pub struct SharedTags {
     pub tags: [AprilTagDetection; MAX_TAGS], // offset 32
 }
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct CliArgs {
+    /// Enable Auto Exposure
+    #[arg(long, default_value_t = false)]
+    ae_enable: bool,
+
+    /// Set exposure time (in microseconds)
+    #[arg(long, default_value_t = 30000)]
+    exposure_time: i32,
+
+    /// Set analogue gain
+    #[arg(long, default_value_t = 7.0)]
+    analogue_gain: f32,
+
+    /// Set the debug view (raw, threshold, or segments)
+    #[arg(long, value_enum, default_value_t = DebugView::Raw)]
+    debug_view: DebugView,
+}
+
 struct AppState {
     tx_video: broadcast::Sender<Bytes>,
     tx_tags: broadcast::Sender<String>,
@@ -81,14 +102,16 @@ struct AppState {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    let args = CliArgs::parse();
+
     let (tx_video, _) = broadcast::channel::<Bytes>(16);
     let (tx_tags, _) = broadcast::channel::<String>(16);
 
     let (controls_tx, controls_rx) = watch::channel(CameraControls {
-        ae_enable: false,
-        exposure_time: 30000,
-        analogue_gain: 7.0,
-        debug_view: DebugView::Raw,
+        ae_enable: args.ae_enable,
+        exposure_time: args.exposure_time,
+        analogue_gain: args.analogue_gain,
+        debug_view: args.debug_view,
     });
 
     let app_state = Arc::new(AppState {
